@@ -44,9 +44,9 @@ impl ConnParsable for QuicParser {
         }
 
         if let Ok(data) = (pdu.mbuf_ref()).get_data_slice(offset, length) {
-            if !self.sessions.is_empty() {
-                return self.sessions[0].parse_packet(data, pdu.dir);
-            }
+            // if !self.sessions.is_empty() {
+            //     return self.sessions[0].parse_packet(data, pdu.dir);
+            // }
             ParseResult::Skipped
         } else {
             log::warn!("Malformed packet on parse");
@@ -474,7 +474,7 @@ impl QuicPacket {
 }
 
 impl QuicConn {
-    pub(crate) fn new() -> QuicConn {
+    pub fn new() -> QuicConn {
         QuicConn {
             packets: Vec::new(),
             cids: HashSet::new(),
@@ -486,7 +486,7 @@ impl QuicConn {
         }
     }
 
-    fn parse_packet(&mut self, data: &[u8], direction: bool) -> ParseResult {
+    pub fn parse_packet(&mut self, data: &[u8], direction: bool) {
         let mut offset = 0;
         // Iterate over all of the data in the datagram
         // Parse as many QUIC packets as possible
@@ -496,16 +496,8 @@ impl QuicConn {
                 self.packets.push(quic);
                 offset = off;
             } else {
-                return ParseResult::Skipped;
+                return
             }
         }
-        if self
-            .packets
-            .last()
-            .is_some_and(|p| p.short_header.is_some())
-        {
-            return ParseResult::Done(0);
-        }
-        ParseResult::Continue(0)
     }
 }
