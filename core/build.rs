@@ -8,10 +8,37 @@ fn main() {
     // modified from https://github.com/deeptir18/cornflakes/blob/master/cornflakes-libos/build.rs
 
     println!("cargo:rerun-if-env-changed=DPDK_PATH");
+    println!("cargo:rerun-if-env-changed=DPDK_VERSION");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/dpdk/inline.c");
+    println!("cargo:rerun-if-changed=src/dpdk/inlined.c");
     let cargo_manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let cargo_dir = Path::new(&cargo_manifest_dir);
+
+    println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2011)");
+    println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2108)");
+    println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2111)");
+    println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2311)");
+    println!("cargo:rustc-check-cfg=cfg(dpdk_ge_2411)");
+    let dpdk_version = env::var("DPDK_VERSION").expect("Set DPDK_VERSION env variable");
+
+    if !["20.11", "21.08", "23.11", "24.11"].contains(&dpdk_version.as_str()) {
+        println!("Unsupported dpdk version");
+        exit(1);
+    }
+
+    println!("cargo:rustc-cfg=dpdk_ge_2011");
+    if dpdk_version != "20.11" {
+        println!("cargo:rustc-cfg=dpdk_ge_2108");
+        if dpdk_version != "21.08" {
+            println!("cargo:rustc-cfg=dpdk_ge_2111");
+            if dpdk_version != "21.11" {
+                println!("cargo:rustc-cfg=dpdk_ge_2311");
+                if dpdk_version != "23.11" {
+                    println!("cargo:rustc-cfg=dpdk_ge_2411");
+                }
+            }
+        }
+    }
 
     let out_dir_s = env::var("OUT_DIR").unwrap();
     let out_dir = Path::new(&out_dir_s);
@@ -83,7 +110,7 @@ fn main() {
     // Step 2: Generate bindings for the DPDK headers.
     let mut builder = Builder::default();
     for header_location in &header_locations {
-        builder = builder.clang_arg(&format!("-I{}", header_location));
+        builder = builder.clang_arg(format!("-I{}", header_location));
     }
 
     let headers_file = Path::new(&cargo_dir)
@@ -92,6 +119,7 @@ fn main() {
         .join("dpdk_headers.h");
     let bindings = builder
         .header(headers_file.to_str().unwrap())
+        .clang_macro_fallback()
         // mark as opaque per bindgen bug on packed+aligned structs:
         // https://github.com/rust-lang/rust-bindgen/issues/1538
         .opaque_type(r"rte_arp_ipv4|rte_arp_hdr")

@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use chrono::Local;
-use crossbeam_channel::{tick, Receiver};
 use csv::Writer;
 use serde::Serialize;
 
@@ -53,7 +52,6 @@ impl Monitor {
             if let Some(monitor_cfg) = &online_cfg.monitor {
                 if let Some(display_cfg) = &monitor_cfg.display {
                     return Some(Display {
-                        ticker: tick(Duration::from_millis(1000)),
                         throughput: display_cfg.throughput,
                         keywords: display_cfg.port_stats.clone(),
                     });
@@ -82,7 +80,7 @@ impl Monitor {
                         port_wtrs.insert(*port_id, wtr);
                     }
                     return Some(Logger {
-                        ticker: tick(Duration::from_millis(log_cfg.interval)),
+                        interval: Duration::from_millis(log_cfg.interval),
                         path,
                         port_wtrs,
                         keywords: log_cfg.port_stats.clone(),
@@ -106,7 +104,7 @@ impl Monitor {
         }
     }
 
-    pub(crate) fn run(&mut self) {
+    pub(crate) async fn run(&mut self) {
         if let Some(logger) = &mut self.logger {
             logger.init_port_wtrs().expect("port logger init");
         }
@@ -120,8 +118,14 @@ impl Monitor {
         let mut prev_rx = init_rx;
         let mut prev_ts = init_ts;
         let mut init = true;
+        let mut display_ticker = tokio::time::interval(Duration::from_millis(1000));
+
+        let mut logger_ticker = self
+            .logger
+            .as_ref()
+            .map(|logger| tokio::time::interval(logger.interval));
         // Add a small delay to allow workers to start polling for packets
-        std::thread::sleep(Duration::from_millis(1000));
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         while self.is_running.load(Ordering::Relaxed) {
             if let Some(duration) = self.duration {
                 if start_ts.elapsed() >= duration {
@@ -130,45 +134,45 @@ impl Monitor {
             }
 
             if let Some(display) = &self.display {
-                if display.ticker.try_recv().is_ok() {
-                    let curr_ts = Instant::now();
-                    let delta = curr_ts - prev_ts;
-                    match AggRxStats::collect(&self.ports, &display.keywords) {
-                        Ok(curr_rx) => {
-                            let nms = delta.as_millis() as f64;
-                            if init {
-                                init_rx = curr_rx;
-                                init_ts = curr_ts;
-                                init = false;
-                            }
-                            if display.throughput {
-                                println!("----------------------------------------------");
-                                println!("Current time: {}s", (curr_ts - start_ts).as_secs());
-                                display.mempool_usage(&self.ports);
-                                AggRxStats::display_rates(curr_rx, prev_rx, nms);
-                                AggRxStats::display_dropped(curr_rx, init_rx);
-                            }
-                            prev_rx = curr_rx;
-                            prev_ts = curr_ts;
+                display_ticker.tick().await;
+                let curr_ts = Instant::now();
+                let delta = curr_ts - prev_ts;
+                match AggRxStats::collect(&self.ports, &display.keywords) {
+                    Ok(curr_rx) => {
+                        #[cfg(feature = "prometheus")]
+                        curr_rx.update_prometheus_stats();
+                        let nms = delta.as_millis() as f64;
+                        if init {
+                            init_rx = curr_rx;
+                            init_ts = curr_ts;
+                            init = false;
                         }
-                        Err(error) => {
-                            log::error!("Monitor display error: {}", error);
+                        if display.throughput {
+                            println!("----------------------------------------------");
+                            println!("Current time: {}s", (curr_ts - start_ts).as_secs());
+                            display.mempool_usage(&self.ports);
+                            AggRxStats::display_rates(curr_rx, prev_rx, nms);
+                            AggRxStats::display_dropped(curr_rx, init_rx);
                         }
+                        prev_rx = curr_rx;
+                        prev_ts = curr_ts;
+                    }
+                    Err(error) => {
+                        log::error!("Monitor display error: {}", error);
                     }
                 }
             }
 
             if let Some(logger) = &mut self.logger {
-                if logger.ticker.try_recv().is_ok() {
-                    match logger.log_stats(init_ts.elapsed()) {
-                        Ok(_) => (),
-                        Err(error) => log::error!("Monitor log error: {}", error),
-                    }
+                logger_ticker.as_mut().unwrap().tick().await;
+                match logger.log_stats(init_ts.elapsed()) {
+                    Ok(_) => (),
+                    Err(error) => log::error!("Monitor log error: {}", error),
                 }
             }
         }
 
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         println!("----------------------------------------------");
         let tputs = Throughputs::new(prev_rx, init_rx, (prev_ts - init_ts).as_millis() as f64);
         println!("{}", tputs);
@@ -182,7 +186,6 @@ impl Monitor {
 
 #[derive(Debug)]
 struct Display {
-    ticker: Receiver<Instant>,
     throughput: bool,
     keywords: Vec<String>,
 }
@@ -209,7 +212,7 @@ impl Display {
 
 #[derive(Debug)]
 struct Logger {
-    ticker: Receiver<Instant>,
+    interval: Duration,
     path: PathBuf,
     port_wtrs: HashMap<PortId, Writer<std::fs::File>>,
     keywords: Vec<String>,
@@ -392,23 +395,44 @@ impl AggRxStats {
     /// Display live bits per second and packets per second between `curr_rx` and `prev_rx`
     fn display_rates(curr_rx: AggRxStats, prev_rx: AggRxStats, nms: f64) {
         println!(
-            "Ingress: {:.0} bps / {:.0} pps",
-            (curr_rx.ingress_bits - prev_rx.ingress_bits) as f64 / nms * 1000.0,
-            (curr_rx.ingress_pkts - prev_rx.ingress_pkts) as f64 / nms * 1000.0
+            "Ingress: {} / {}",
+            pretty_print_unit(
+                (curr_rx.ingress_bits - prev_rx.ingress_bits) as f64 / nms * 1000.0,
+                "bps",
+            ),
+            pretty_print_unit(
+                (curr_rx.ingress_pkts - prev_rx.ingress_pkts) as f64 / nms * 1000.0,
+                "pps",
+            ),
         );
         println!(
-            "Good:    {:.0} bps / {:.0} pps",
-            (curr_rx.good_bits - prev_rx.good_bits) as f64 / nms * 1000.0,
-            (curr_rx.good_pkts - prev_rx.good_pkts) as f64 / nms * 1000.0
+            "Good:    {} / {}",
+            pretty_print_unit(
+                (curr_rx.good_bits - prev_rx.good_bits) as f64 / nms * 1000.0,
+                "bps",
+            ),
+            pretty_print_unit(
+                (curr_rx.good_pkts - prev_rx.good_pkts) as f64 / nms * 1000.0,
+                "pps",
+            ),
         );
         println!(
-            "Process: {:.0} bps / {:.0} pps",
-            (curr_rx.process_bits - prev_rx.process_bits) as f64 / nms * 1000.0,
-            (curr_rx.process_pkts - prev_rx.process_pkts) as f64 / nms * 1000.0
+            "Process: {} / {}",
+            pretty_print_unit(
+                (curr_rx.process_bits - prev_rx.process_bits) as f64 / nms * 1000.0,
+                "bps",
+            ),
+            pretty_print_unit(
+                (curr_rx.process_pkts - prev_rx.process_pkts) as f64 / nms * 1000.0,
+                "pps",
+            ),
         );
         println!(
-            "Drop: {} pps ({}%)",
-            (curr_rx.dropped_pkts() - prev_rx.dropped_pkts()) as f64 / nms * 1000.0,
+            "Drop: {} ({}%)",
+            pretty_print_unit(
+                (curr_rx.dropped_pkts() - prev_rx.dropped_pkts()) as f64 / nms * 1000.0,
+                "pps",
+            ),
             100.0
                 * ((curr_rx.dropped_pkts() - prev_rx.dropped_pkts()) as f64
                     / (curr_rx.ingress_pkts - prev_rx.ingress_pkts) as f64)
@@ -417,30 +441,72 @@ impl AggRxStats {
 
     fn display_dropped(curr_rx: AggRxStats, init_rx: AggRxStats) {
         println!(
-            "HW Dropped: {} pkts ({}%)",
-            curr_rx.hw_dropped_pkts - init_rx.hw_dropped_pkts,
+            "HW Dropped: {} ({}%)",
+            pretty_print_unit(
+                (curr_rx.hw_dropped_pkts - init_rx.hw_dropped_pkts) as f64,
+                "pkt",
+            ),
             100.0
                 * ((curr_rx.hw_dropped_pkts - init_rx.hw_dropped_pkts) as f64
                     / (curr_rx.ingress_pkts - init_rx.ingress_pkts) as f64)
         );
         println!(
-            "SW Dropped: {} pkts ({}%)",
-            curr_rx.sw_dropped_pkts - init_rx.sw_dropped_pkts,
+            "SW Dropped: {} ({}%)",
+            pretty_print_unit(
+                (curr_rx.sw_dropped_pkts - init_rx.sw_dropped_pkts) as f64,
+                "pkt",
+            ),
             100.0
                 * ((curr_rx.sw_dropped_pkts - init_rx.sw_dropped_pkts) as f64
                     / (curr_rx.ingress_pkts - init_rx.ingress_pkts) as f64)
         );
         println!(
-            "Total Dropped: {} pkts ({}%)",
-            curr_rx.dropped_pkts() - init_rx.dropped_pkts(),
+            "Total Dropped: {} ({}%)",
+            pretty_print_unit(
+                (curr_rx.dropped_pkts() - init_rx.dropped_pkts()) as f64,
+                "pkt",
+            ),
             100.0
                 * ((curr_rx.dropped_pkts() - init_rx.dropped_pkts()) as f64
                     / (curr_rx.ingress_pkts - init_rx.ingress_pkts) as f64)
+        );
+        println!(
+            "Total Packets: {}",
+            pretty_print_unit((curr_rx.ingress_pkts - init_rx.ingress_pkts) as f64, "pkt",),
         );
     }
 
     fn dropped_pkts(&self) -> u64 {
         self.hw_dropped_pkts + self.sw_dropped_pkts
+    }
+
+    #[cfg(feature = "prometheus")]
+    fn update_prometheus_stats(&self) {
+        use crate::stats::DPDK_STATS;
+        DPDK_STATS
+            .ingress_pkts
+            .inc_by(self.ingress_pkts - DPDK_STATS.ingress_pkts.get());
+        DPDK_STATS
+            .ingress_bits
+            .inc_by(self.ingress_bits - DPDK_STATS.ingress_bits.get());
+        DPDK_STATS
+            .good_pkts
+            .inc_by(self.good_pkts - DPDK_STATS.good_pkts.get());
+        DPDK_STATS
+            .good_bits
+            .inc_by(self.good_bits - DPDK_STATS.good_bits.get());
+        DPDK_STATS
+            .process_pkts
+            .inc_by(self.process_pkts - DPDK_STATS.process_pkts.get());
+        DPDK_STATS
+            .process_bits
+            .inc_by(self.process_bits - DPDK_STATS.process_bits.get());
+        DPDK_STATS
+            .hw_dropped_pkts
+            .inc_by(self.hw_dropped_pkts - DPDK_STATS.hw_dropped_pkts.get());
+        DPDK_STATS
+            .sw_dropped_pkts
+            .inc_by(self.sw_dropped_pkts - DPDK_STATS.sw_dropped_pkts.get());
     }
 }
 
@@ -488,24 +554,46 @@ impl fmt::Display for Throughputs {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(
             f,
-            "AVERAGE Ingress: {:.3} bps / {:.3} pps",
-            self.avg_ingress_bps, self.avg_ingress_pps,
+            "AVERAGE Ingress: {} / {}",
+            pretty_print_unit(self.avg_ingress_bps, "bps"),
+            pretty_print_unit(self.avg_ingress_pps, "pps"),
         )?;
         writeln!(
             f,
-            "AVERAGE Good:    {:.3} bps / {:.3} pps",
-            self.avg_good_bps, self.avg_good_pps,
+            "AVERAGE Good:    {} / {}",
+            pretty_print_unit(self.avg_good_bps, "bps"),
+            pretty_print_unit(self.avg_good_pps, "pps"),
         )?;
         writeln!(
             f,
-            "AVERAGE Process: {:.3} bps / {:.3} pps",
-            self.avg_process_bps, self.avg_process_pps,
+            "AVERAGE Process: {} / {}",
+            pretty_print_unit(self.avg_process_bps, "bps"),
+            pretty_print_unit(self.avg_process_pps, "pps"),
         )?;
         writeln!(
             f,
-            "DROPPED: {} pkts ({}%)",
-            self.tot_dropped_pkts, self.percent_dropped,
+            "DROPPED: {} ({}%)",
+            pretty_print_unit(self.tot_dropped_pkts as f64, "pkt"),
+            self.percent_dropped,
         )?;
         Ok(())
     }
+}
+
+fn pretty_print_unit(mut value: f64, unit: &str) -> String {
+    let kilo_coef = 1000.;
+    let mut unit_prefix = "";
+    if value > kilo_coef {
+        value /= kilo_coef;
+        unit_prefix = "k";
+        if value > kilo_coef {
+            value /= kilo_coef;
+            unit_prefix = "M";
+            if value > kilo_coef {
+                value /= kilo_coef;
+                unit_prefix = "G";
+            }
+        }
+    }
+    format!("{value:.4} {unit_prefix}{unit}")
 }

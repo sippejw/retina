@@ -2,48 +2,53 @@ use super::CoreId;
 use crate::config::ConnTrackConfig;
 use crate::conntrack::{ConnTracker, TrackerConfig};
 use crate::dpdk;
-use crate::filter::Filter;
 use crate::memory::mbuf::Mbuf;
 use crate::port::{RxQueue, RxQueueType};
-use crate::protocols::stream::ParserRegistry;
+use crate::stats::{
+    StatExt, IDLE_CYCLES, IGNORED_BY_PACKET_FILTER_BYTE, IGNORED_BY_PACKET_FILTER_PKT, TOTAL_BYTE,
+    TOTAL_CYCLES, TOTAL_PKT,
+};
 use crate::subscription::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use itertools::Itertools;
 
 /// A RxCore polls from `rxqueues` and reduces the stream of packets into
 /// a stream of higher-level network events to be processed by the user.
-pub(crate) struct RxCore<'a, S>
+pub(crate) struct RxCore<S>
 where
     S: Subscribable,
 {
     pub(crate) id: CoreId,
     pub(crate) rxqueues: Vec<RxQueue>,
-    pub(crate) filter: Filter,
     pub(crate) conntrack: ConnTrackConfig,
-    pub(crate) subscription: Arc<Subscription<'a, S>>,
+    #[cfg(feature = "prometheus")]
+    pub(crate) is_prometheus_enabled: bool,
+    pub(crate) subscription: Arc<Subscription<S>>,
     pub(crate) is_running: Arc<AtomicBool>,
 }
 
-impl<'a, S> RxCore<'a, S>
+impl<S> RxCore<S>
 where
     S: Subscribable,
 {
     pub(crate) fn new(
         core_id: CoreId,
         rxqueues: Vec<RxQueue>,
-        filter: Filter,
         conntrack: ConnTrackConfig,
-        subscription: Arc<Subscription<'a, S>>,
+        #[cfg(feature = "prometheus")] is_prometheus_enabled: bool,
+        subscription: Arc<Subscription<S>>,
         is_running: Arc<AtomicBool>,
     ) -> Self {
         RxCore {
             id: core_id,
             rxqueues,
-            filter,
             conntrack,
+            #[cfg(feature = "prometheus")]
+            is_prometheus_enabled,
             subscription,
             is_running,
         }
@@ -87,13 +92,28 @@ where
         let mut nb_bytes = 0;
 
         let config = TrackerConfig::from(&self.conntrack);
-        let registry = ParserRegistry::build::<S>(&self.filter).expect("Unable to build registry");
+        let registry = S::Tracked::parsers();
         log::debug!("{:#?}", registry);
-        let mut conn_table = ConnTracker::<S::Tracked>::new(config, registry);
+        let mut conn_table = ConnTracker::<S::Tracked>::new(config, registry, self.id);
+
+        let mut now = Instant::now();
 
         while self.is_running.load(Ordering::Relaxed) {
             for rxqueue in self.rxqueues.iter() {
                 let mbufs: Vec<Mbuf> = self.rx_burst(rxqueue, 32);
+                if mbufs.is_empty() {
+                    IDLE_CYCLES.inc();
+                }
+
+                TOTAL_CYCLES.inc();
+                if TOTAL_CYCLES.get() & 1023 == 512 {
+                    now = Instant::now();
+                }
+                #[cfg(feature = "prometheus")]
+                if TOTAL_CYCLES.get() & 1023 == 0 && self.is_prometheus_enabled {
+                    crate::stats::update_thread_local_stats(self.id);
+                }
+
                 for mbuf in mbufs.into_iter() {
                     // log::debug!("{:#?}", mbuf);
                     // log::debug!("Mark: {}", mbuf.mark());
@@ -106,10 +126,21 @@ where
                     // );
                     nb_pkts += 1;
                     nb_bytes += mbuf.data_len() as u64;
-                    S::process_packet(mbuf, &self.subscription, &mut conn_table);
+
+                    TOTAL_PKT.inc();
+                    TOTAL_BYTE.inc_by(mbuf.data_len() as u64);
+
+                    let actions = self.subscription.continue_packet(&mbuf, &self.id);
+                    if !actions.drop() {
+                        self.subscription
+                            .process_packet(mbuf, &mut conn_table, actions);
+                    } else {
+                        IGNORED_BY_PACKET_FILTER_PKT.inc();
+                        IGNORED_BY_PACKET_FILTER_BYTE.inc_by(mbuf.data_len() as u64);
+                    }
                 }
             }
-            conn_table.check_inactive(&self.subscription);
+            conn_table.check_inactive(&self.subscription, now);
         }
 
         // // Deliver remaining data in table from unfinished connections
