@@ -2,7 +2,7 @@
 //!
 //! See [tls-parser](https://docs.rs/tls-parser/latest/tls_parser/) for dependency type definitions.
 
-use crate::utils::base64;
+use crate::{protocols::stream::quic::QuicTransportParameter, utils::base64};
 
 use serde::Serialize;
 use tls_parser::{
@@ -27,6 +27,7 @@ pub struct ClientHello {
     pub signature_algs: Vec<SignatureScheme>,
     pub key_shares: Vec<KeyShareEntry>,
     pub supported_versions: Vec<TlsVersion>,
+    pub quic_transport_parameters: Vec<QuicTransportParameter>,
 }
 
 /// A parsed TLS ServerHello message.

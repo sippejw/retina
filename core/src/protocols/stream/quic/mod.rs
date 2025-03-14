@@ -162,3 +162,9 @@ impl QuicPacket {
         self.payload_bytes_count.unwrap_or_default()
     }
 }
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct QuicTransportParameter {
+    pub parameter_id: u64,
+    pub parameter: Vec<u8>,
+}
