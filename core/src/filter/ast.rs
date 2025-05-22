@@ -1,6 +1,6 @@
 use super::hardware;
 use super::ptree::FilterLayer;
-use super::Level;
+use super::{Level, SubscriptionSpec};
 
 use std::collections::HashSet;
 use std::fmt;
@@ -166,30 +166,30 @@ impl Predicate {
     pub(super) fn is_prev_layer(
         &self,
         filter_layer: FilterLayer,
-        subscription_level: &Level,
+        subscription: &SubscriptionSpec,
     ) -> bool {
         match filter_layer {
             FilterLayer::PacketContinue => false,
             FilterLayer::Packet => {
                 // Packet would have already been delivered in PacketContinue
-                self.on_packet() && matches!(subscription_level, Level::Packet)
+                self.on_packet() && matches!(subscription.level, Level::Packet)
             }
             FilterLayer::PacketDeliver => {
                 // Subscription not delivered in this filter
-                !matches!(subscription_level, Level::Packet) ||
+                !matches!(subscription.level, Level::Packet) ||
                     // Subscription delivered in PacketContinue
                     self.on_packet()
             }
             FilterLayer::Protocol => self.on_packet(),
             FilterLayer::Session => {
                 (self.on_packet() || self.on_proto()) &&  // prev filter
-                !matches!(subscription_level, Level::Session) // no delivery req'd
+                !subscription.deliver_on_session()
             }
             FilterLayer::ConnectionDeliver => {
                 // Delivered elsewhere
-                !matches!(subscription_level, Level::Connection | Level::Static) ||
+                !matches!(subscription.level, Level::Connection | Level::Static) ||
                     // Delivered in packet filter
-                    (matches!(subscription_level, Level::Static) && self.on_packet())
+                    (matches!(subscription.level, Level::Static) && self.on_packet())
             }
         }
     }
@@ -762,7 +762,7 @@ pub(super) fn is_excl_int(
             BinOp::In => return peer_to < from || peer_from > to,
             _ => {}
         },
-        BinOp::Re | BinOp::En | BinOp::Contains | BinOp::ByteRe => {}
+        BinOp::Re | BinOp::En | BinOp::Contains | BinOp::ByteRe | BinOp::NotContains => {}
     }
     false
 }
@@ -899,6 +899,7 @@ pub enum BinOp {
     En,
     ByteRe,
     Contains,
+    NotContains,
 }
 
 impl fmt::Display for BinOp {
@@ -915,6 +916,7 @@ impl fmt::Display for BinOp {
             BinOp::En => write!(f, "eq"),
             BinOp::ByteRe => write!(f, "~b"),
             BinOp::Contains => write!(f, "contains"),
+            BinOp::NotContains => write!(f, "not contains"),
         }
     }
 }
