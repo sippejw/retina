@@ -11,7 +11,7 @@ fn var_int(i: &[u8]) -> (u64, &[u8]) {
     let length = 1 << prefix;
     v &= 0x3f;
     for &j in i.iter().take(length).skip(1) {
-        v = (v << 8) | i[j as usize] as u64;
+        v = (v << 8) | j as u64;
     }
     (v, &i[length..])
 }
