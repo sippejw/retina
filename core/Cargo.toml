@@ -31,6 +31,7 @@ log = { version = "0.4", features = ["release_max_level_info"] }
 maplit = "1.0.2"
 md5 = "0.7.0"
 nom = "7.1.3"
+num_enum = "0.7.3"
 pcap = "0.8.1"
 pest = "2.5.7"
 pest_derive = "2.5"
