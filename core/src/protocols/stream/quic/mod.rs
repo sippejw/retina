@@ -20,20 +20,23 @@ TODO: support parsing the tls out of the initial quic packet setup
 TODO support dns over quic
 TODO: support HTTP/3
 */
-pub(crate) mod parser;
+use serde::Serialize;
 
 use std::collections::HashSet;
 
-pub use self::header::{QuicLongHeader, QuicShortHeader};
-use crypto::Open;
-use frame::QuicFrame;
-use header::LongHeaderPacketType;
-use serde::Serialize;
-
-use super::tls::Tls;
 pub(crate) mod crypto;
 pub(crate) mod frame;
 pub(crate) mod header;
+pub(crate) mod parser;
+pub(crate) mod qtp;
+
+pub use self::header::{QuicLongHeader, QuicShortHeader};
+pub use self::qtp::{QuicTransportParameters, TransportParameter};
+pub use frame::QuicFrame;
+
+use super::tls::Tls;
+use crypto::Open;
+use header::LongHeaderPacketType;
 
 /// Errors Thrown throughout QUIC parsing. These are handled by retina and used to skip packets.
 #[derive(Debug)]
@@ -91,6 +94,12 @@ pub struct QuicPacket {
 
     /// The number of bytes contained in the estimated payload
     pub payload_bytes_count: Option<u64>,
+
+    // length of the packet number in bytes
+    pub packet_number_length: Option<u8>,
+
+    // packet number converted to u32 (max size of packet number)
+    pub packet_number: Option<u32>,
 
     pub frames: Option<Vec<QuicFrame>>,
 }
@@ -161,10 +170,4 @@ impl QuicPacket {
     pub fn payload_bytes_count(&self) -> u64 {
         self.payload_bytes_count.unwrap_or_default()
     }
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct QuicTransportParameter {
-    pub parameter_id: u64,
-    pub parameter: Vec<u8>,
 }

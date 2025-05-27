@@ -15,10 +15,10 @@ use super::handshake::{
 };
 use super::Tls;
 use crate::conntrack::pdu::L4Pdu;
+use crate::protocols::stream::quic::qtp::QuicTransportParameters;
 use crate::protocols::stream::{
     ConnParsable, ParseResult, ParsingState, ProbeResult, Session, SessionData,
 };
-use crate::protocols::stream::quic::QuicTransportParameter;
 
 use tls_parser::*;
 
@@ -185,14 +185,9 @@ impl Tls {
                         TlsExtension::SupportedVersions(ref v) => {
                             client_hello.supported_versions = v.clone();
                         }
-                        TlsExtension::QuicTransportParameters(ref v) => {
-                            client_hello.quic_transport_parameters = v
-                                .iter()
-                                .map(|p| QuicTransportParameter {
-                                    parameter_id: p.id,
-                                    parameter: p.value.to_vec(),
-                                })
-                                .collect();
+                        TlsExtension::QuicTransportParameters(v) => {
+                            client_hello.quic_transport_parameters =
+                                Some(QuicTransportParameters::new(v.to_vec()));
                         }
                         _ => (),
                     }

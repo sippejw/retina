@@ -237,11 +237,14 @@ impl QuicPacket {
             }
             offset += scid_len as usize;
 
+            // Initialize variables for packet type specific fields
             let token_len;
             let token;
             let packet_len;
             let retry_tag;
             let decrypted_payload;
+            let packet_number_length;
+            let packet_number;
             // Parse packet type specific fields
             match packet_type {
                 LongHeaderPacketType::Initial => {
@@ -291,15 +294,16 @@ impl QuicPacket {
                     }
                     // Parse packet number
                     let packet_num_len = ((unprotected_header & 0b00000011) + 1) as usize;
+                    packet_number_length = Some(packet_num_len as u8);
                     let packet_number_bytes =
                         QuicPacket::access_data(data, offset, offset + packet_num_len)?;
-                    let mut packet_number = vec![0; 4 - packet_num_len];
+                    let mut packet_number_calc = vec![0; 4 - packet_num_len];
                     for i in 0..packet_num_len {
-                        packet_number.push(packet_number_bytes[i] ^ mask[i + 1]);
+                        packet_number_calc.push(packet_number_bytes[i] ^ mask[i + 1]);
                     }
-
-                    let initial_packet_number_bytes = &packet_number[4 - packet_num_len..];
-                    let packet_number_int = BigEndian::read_i32(&packet_number);
+                    let initial_packet_number_bytes = &packet_number_calc[4 - packet_num_len..];
+                    let packet_number_int = BigEndian::read_i32(&packet_number_calc);
+                    packet_number = Some(packet_number_int as u32);
                     offset += packet_num_len;
                     // Parse the encrypted payload
                     let tag_len = conn.client_opener.as_ref().unwrap().alg().tag_len();
@@ -349,6 +353,8 @@ impl QuicPacket {
                     token = None;
                     retry_tag = None;
                     decrypted_payload = None;
+                    packet_number_length = None;
+                    packet_number = None;
                     // Parse payload length
                     let packet_len_len = QuicPacket::get_var_len(
                         QuicPacket::access_data(data, offset, offset + 1)?[0],
@@ -364,6 +370,8 @@ impl QuicPacket {
                 LongHeaderPacketType::Retry => {
                     packet_len = None;
                     decrypted_payload = None;
+                    packet_number_length = None;
+                    packet_number = None;
                     if data.len() > (offset + 16) {
                         token_len = Some((data.len() - offset - 16) as u64);
                     } else {
@@ -431,6 +439,8 @@ impl QuicPacket {
                         retry_tag,
                     }),
                     frames,
+                    packet_number_length,
+                    packet_number,
                 },
                 offset,
             ))
@@ -463,6 +473,8 @@ impl QuicPacket {
                     long_header: None,
                     payload_bytes_count: Some(payload_bytes_count),
                     frames: None,
+                    packet_number_length: None,
+                    packet_number: None,
                 },
                 offset,
             ))
