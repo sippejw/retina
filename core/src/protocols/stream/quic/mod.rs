@@ -57,7 +57,7 @@ pub enum QuicError {
 }
 
 /// Parsed Quic connections
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct QuicConn {
     // All packets associated with the connection
     pub packets: Vec<QuicPacket>,
@@ -84,7 +84,7 @@ pub struct QuicConn {
 }
 
 /// Parsed Quic Packet contents
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct QuicPacket {
     /// Quic Short header
     pub short_header: Option<QuicShortHeader>,

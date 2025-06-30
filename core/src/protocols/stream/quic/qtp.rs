@@ -1,5 +1,5 @@
 use num_enum::TryFromPrimitive;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 use std::cmp::Ordering;
 
@@ -53,7 +53,7 @@ pub enum TransportParameterId {
     GreaseQuicBit = 0x2AB2,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum TransportParameter {
     OriginalDestinationConnectionId(Vec<u8>),
     MaxIdleTimeout {
@@ -323,7 +323,17 @@ impl QuicTransportParameters {
                         TransportParameter::RetrySourceConnectionId(parameter_value.to_vec())
                     }
                     Ok(TransportParameterId::VersionInformation) => {
-                        todo!("Parse Version Information")
+                        TransportParameter::VersionInformation {
+                            chosen_version:  u32::from_be_bytes(
+                            parameter_value[0..4].try_into().expect("Invalid version length"),
+                        ),
+                            supported_versions: parameter_value[4..]
+                            .chunks(4)
+                            .map(|chunk| u32::from_be_bytes(
+                                chunk.try_into().expect("Invalid version length"),
+                            ))
+                            .collect::<Vec<u32>>(),
+                        }
                     }
                     Ok(TransportParameterId::MaxDatagramFrameSize) => {
                         TransportParameter::MaxDatagramFrameSize {

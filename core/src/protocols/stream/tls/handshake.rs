@@ -27,6 +27,9 @@ pub struct ClientHello {
     pub signature_algs: Vec<SignatureScheme>,
     pub key_shares: Vec<KeyShareEntry>,
     pub supported_versions: Vec<TlsVersion>,
+    pub psk_exchange_modes: Vec<u8>,
+    pub compress_certificate: Vec<u8>,
+    pub record_size_limit: Option<u16>,
     pub quic_transport_parameters: Option<QuicTransportParameters>,
 }
 

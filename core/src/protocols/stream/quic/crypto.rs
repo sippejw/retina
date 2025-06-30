@@ -157,6 +157,19 @@ impl Open {
         self.hp_key.algorithm().sample_len()
     }
 }
+
+impl Clone for Open {
+    fn clone(&self) -> Self {
+        Open {
+            alg: self.alg,
+            initial_key: self.initial_key.clone(),
+            hp_key: aead::quic::HeaderProtectionKey::new(self.alg.get_ring_hp(), &self.initial_key)
+                .expect("Failed to clone hp_key"),
+            iv: self.iv.clone(),
+        }
+    }
+}
+
 impl std::fmt::Debug for Open {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Point")
