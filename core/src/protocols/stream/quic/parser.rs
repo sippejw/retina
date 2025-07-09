@@ -13,7 +13,7 @@ use crate::protocols::stream::{
     ConnParsable, L4Pdu, ParseResult, ParsingState, ProbeResult, Session, SessionData,
 };
 use byteorder::{BigEndian, ByteOrder};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use tls_parser::parse_tls_message_handshake;
 
 use super::QuicConn;
@@ -394,30 +394,41 @@ impl QuicPacket {
 
             let mut frames: Option<Vec<QuicFrame>> = None;
             // Grab the proper buffer for CRYPTO frame data
-            let crypto_buffer: &mut Vec<u8> = if dir {
-                conn.client_buffer.as_mut()
+            let (crypto_map, crypto_buffer): (&mut BTreeMap<usize, Vec<u8>>, &mut Vec<u8>) = if dir {
+                (&mut conn.client_map, &mut conn.client_buffer)
             } else {
-                conn.server_buffer.as_mut()
+                (&mut conn.server_map, &mut conn.server_buffer)
             };
             // If decrypted payload is not None, parse the frames
             if let Some(frame_bytes) = decrypted_payload {
                 // Get frames and reassembled CRYPTO data
                 // Pass the buffer's current length as starting offset for CRYPTO frames
-                let (q_frames, mut crypto_bytes) =
-                    QuicFrame::parse_frames(&frame_bytes, crypto_buffer.len())?;
+                let q_frames =
+                    QuicFrame::parse_frames(&frame_bytes, crypto_map)?;
                 frames = Some(q_frames);
-                if !crypto_bytes.is_empty() {
-                    crypto_buffer.append(&mut crypto_bytes);
+                if !crypto_map.is_empty() {
+                    // Reassemble CRYPTO frames into a single buffer
+                    // let mut reassembled_crypto: Vec<u8> = Vec::new();
+                    let mut expected_offset = crypto_buffer.len();
+                    let mut to_remove = Vec::new();
+                    for (crypto_offset, crypto_data) in crypto_map.iter() {
+                        if *crypto_offset != expected_offset {
+                            break;
+                        }
+                        expected_offset += crypto_data.len();
+                        crypto_buffer.extend_from_slice(crypto_data);
+                        to_remove.push(*crypto_offset);
+                    }
+                    for offset in to_remove {
+                        crypto_map.remove(&offset);
+                    }
                     // Attempt to parse CRYPTO buffer
                     // clear on success
-                    // TODO: This naive buffer will not work for out of order frames
-                    // across packets or multiple messages in the same buffer
-                    match parse_tls_message_handshake(crypto_buffer) {
-                        Ok((_, msg)) => {
-                            conn.tls.parse_message_level(&msg, dir);
-                            crypto_buffer.clear();
-                        }
-                        Err(_) => return Err(QuicError::TlsParseFail),
+                    if let Ok((_, msg)) = parse_tls_message_handshake(crypto_buffer)
+                    {
+                        conn.tls.parse_message_level(&msg, dir);
+                        crypto_buffer.clear();
+                        crypto_map.clear();
                     }
                 }
             }
@@ -490,7 +501,9 @@ impl QuicConn {
             tls: Tls::new(),
             client_opener: None,
             server_opener: None,
+            client_map: BTreeMap::new(),
             client_buffer: Vec::new(),
+            server_map: BTreeMap::new(),
             server_buffer: Vec::new(),
         }
     }

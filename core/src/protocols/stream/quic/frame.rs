@@ -78,10 +78,9 @@ impl QuicFrame {
     // it also returns the reassembled CRYPTO frame bytes as a Vec<u8>
     pub fn parse_frames(
         data: &[u8],
-        mut expected_offset: usize,
-    ) -> Result<(Vec<QuicFrame>, Vec<u8>), QuicError> {
+        crypto_map: &mut BTreeMap<usize, Vec<u8>>,
+    ) -> Result<Vec<QuicFrame>, QuicError> {
         let mut frames: Vec<QuicFrame> = Vec::new();
-        let mut crypto_map: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
         let mut offset = 0;
         // Iterate over plaintext payload bytes, this is a list of frames
         while offset < data.len() {
@@ -257,14 +256,6 @@ impl QuicFrame {
                 _ => return Err(QuicError::UnknownFrameType),
             }
         }
-        let mut reassembled_crypto: Vec<u8> = Vec::new();
-        for (crypto_offset, crypto_data) in crypto_map {
-            if crypto_offset != expected_offset {
-                return Err(QuicError::MissingCryptoFrames);
-            }
-            expected_offset += crypto_data.len();
-            reassembled_crypto.extend(crypto_data);
-        }
-        Ok((frames, reassembled_crypto))
+        Ok(frames)
     }
 }

@@ -22,7 +22,7 @@ TODO: support HTTP/3
 */
 use serde::Serialize;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, BTreeMap};
 
 pub(crate) mod crypto;
 pub(crate) mod frame;
@@ -76,9 +76,15 @@ pub struct QuicConn {
 
     // Client buffer for multi-packet TLS messages
     #[serde(skip_serializing)]
+    pub client_map: BTreeMap<usize, Vec<u8>>,
+
+    #[serde(skip_serializing)]
     pub client_buffer: Vec<u8>,
 
     // Server buffer for multi-packet TLS messages
+    #[serde(skip_serializing)]
+    pub server_map: BTreeMap<usize, Vec<u8>>,
+
     #[serde(skip_serializing)]
     pub server_buffer: Vec<u8>,
 }
