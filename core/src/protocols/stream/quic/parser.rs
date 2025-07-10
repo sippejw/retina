@@ -75,12 +75,14 @@ impl ConnParsable for QuicParser {
                 }
 
                 // Check if version is known
+                // An unknown version must be handled as
+                // a potential QUIC packet due to Version Negotiation
                 let version = ((data[1] as u32) << 24)
                     | ((data[2] as u32) << 16)
                     | ((data[3] as u32) << 8)
                     | (data[4] as u32);
                 match QuicVersion::from_u32(version) {
-                    QuicVersion::Unknown => ProbeResult::NotForUs,
+                    QuicVersion::Unknown => ProbeResult::Unsure,
                     _ => ProbeResult::Certain,
                 }
             } else {
