@@ -1,11 +1,27 @@
 // QUIC Frame types and parsing
 // Implemented per RFC 9000: https://datatracker.ietf.org/doc/html/rfc9000#name-frame-types-and-formats
 
+use num_enum::TryFromPrimitive;
 use serde::Serialize;
+
 use std::collections::BTreeMap;
 
 use crate::protocols::stream::quic::QuicError;
 use crate::protocols::stream::quic::QuicPacket;
+
+// QUIC Frame IDs, used to identify frame types as defined by RFC 9000 Section 19
+// https://datatracker.ietf.org/doc/html/rfc9000#name-frame-types-and-formats
+#[derive(Clone, Debug, Serialize, TryFromPrimitive)]
+#[repr(u64)]
+pub enum QuicFrameId {
+    Padding = 0x00,
+    Ping = 0x01,
+    Ack = 0x02,
+    AckEcn = 0x03,
+    ResetStream = 0x04,
+    StopSending = 0x05,
+    Crypto = 0x06,
+}
 
 // Types of supported QUIC frames
 // Currently only includes those seen in the Init and Handshake packets
@@ -25,6 +41,19 @@ pub enum QuicFrame {
     Crypto {
         offset: u64,
     },
+}
+
+impl QuicFrame {
+    // Returns the frame type ID as a u8
+    // Used for serialization and frame identification
+    pub fn get_frame_type(&self) -> u8 {
+        match self {
+            QuicFrame::Padding { .. } => QuicFrameId::Padding as u8,
+            QuicFrame::Ping => QuicFrameId::Ping as u8,
+            QuicFrame::Ack { .. } => QuicFrameId::Ack as u8,
+            QuicFrame::Crypto { .. } => QuicFrameId::Crypto as u8,
+        }
+    }
 }
 
 // ACK Range field, part of ACK frame
@@ -49,10 +78,9 @@ impl QuicFrame {
     // it also returns the reassembled CRYPTO frame bytes as a Vec<u8>
     pub fn parse_frames(
         data: &[u8],
-        mut expected_offset: usize,
-    ) -> Result<(Vec<QuicFrame>, Vec<u8>), QuicError> {
+        crypto_map: &mut BTreeMap<usize, Vec<u8>>,
+    ) -> Result<Vec<QuicFrame>, QuicError> {
         let mut frames: Vec<QuicFrame> = Vec::new();
-        let mut crypto_map: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
         let mut offset = 0;
         // Iterate over plaintext payload bytes, this is a list of frames
         while offset < data.len() {
@@ -65,8 +93,8 @@ impl QuicFrame {
                 offset + frame_type_len,
             )?)?;
             offset += frame_type_len;
-            match frame_type {
-                0x00 => {
+            match QuicFrameId::try_from(frame_type) {
+                Ok(QuicFrameId::Padding) => {
                     // Handle PADDING
                     let mut length = 0;
                     while offset + length + 1 < data.len()
@@ -79,11 +107,11 @@ impl QuicFrame {
                     length += frame_type_len; // Add the original frame type bytes to length. Wireshark also does this
                     frames.push(QuicFrame::Padding { length });
                 }
-                0x01 => {
+                Ok(QuicFrameId::Ping) => {
                     // Handle PING
                     frames.push(QuicFrame::Ping);
                 }
-                0x02 | 0x03 => {
+                Ok(QuicFrameId::Ack) | Ok(QuicFrameId::AckEcn) => {
                     // Handle ACK
                     // Parse Largest Acknowledged
                     let largest_acknowledged_len = QuicPacket::get_var_len(
@@ -192,7 +220,7 @@ impl QuicFrame {
                         ecn_counts,
                     })
                 }
-                0x06 => {
+                Ok(QuicFrameId::Crypto) => {
                     // Handle CRYPTO frame
                     // Parse offset
                     let crypto_offset_len = QuicPacket::get_var_len(
@@ -228,14 +256,6 @@ impl QuicFrame {
                 _ => return Err(QuicError::UnknownFrameType),
             }
         }
-        let mut reassembled_crypto: Vec<u8> = Vec::new();
-        for (crypto_offset, crypto_data) in crypto_map {
-            if crypto_offset != expected_offset {
-                return Err(QuicError::MissingCryptoFrames);
-            }
-            expected_offset += crypto_data.len();
-            reassembled_crypto.extend(crypto_data);
-        }
-        Ok((frames, reassembled_crypto))
+        Ok(frames)
     }
 }

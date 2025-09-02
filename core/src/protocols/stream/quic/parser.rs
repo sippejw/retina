@@ -13,7 +13,7 @@ use crate::protocols::stream::{
     ConnParsable, L4Pdu, ParseResult, ParsingState, ProbeResult, Session, SessionData,
 };
 use byteorder::{BigEndian, ByteOrder};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use tls_parser::parse_tls_message_handshake;
 
 use super::QuicConn;
@@ -75,12 +75,14 @@ impl ConnParsable for QuicParser {
                 }
 
                 // Check if version is known
+                // An unknown version must be handled as
+                // a potential QUIC packet due to Version Negotiation
                 let version = ((data[1] as u32) << 24)
                     | ((data[2] as u32) << 16)
                     | ((data[3] as u32) << 8)
                     | (data[4] as u32);
                 match QuicVersion::from_u32(version) {
-                    QuicVersion::Unknown => ProbeResult::NotForUs,
+                    QuicVersion::Unknown => ProbeResult::Unsure,
                     _ => ProbeResult::Certain,
                 }
             } else {
@@ -237,11 +239,14 @@ impl QuicPacket {
             }
             offset += scid_len as usize;
 
+            // Initialize variables for packet type specific fields
             let token_len;
             let token;
             let packet_len;
             let retry_tag;
             let decrypted_payload;
+            let packet_number_length;
+            let packet_number;
             // Parse packet type specific fields
             match packet_type {
                 LongHeaderPacketType::Initial => {
@@ -291,15 +296,16 @@ impl QuicPacket {
                     }
                     // Parse packet number
                     let packet_num_len = ((unprotected_header & 0b00000011) + 1) as usize;
+                    packet_number_length = Some(packet_num_len as u8);
                     let packet_number_bytes =
                         QuicPacket::access_data(data, offset, offset + packet_num_len)?;
-                    let mut packet_number = vec![0; 4 - packet_num_len];
+                    let mut packet_number_calc = vec![0; 4 - packet_num_len];
                     for i in 0..packet_num_len {
-                        packet_number.push(packet_number_bytes[i] ^ mask[i + 1]);
+                        packet_number_calc.push(packet_number_bytes[i] ^ mask[i + 1]);
                     }
-
-                    let initial_packet_number_bytes = &packet_number[4 - packet_num_len..];
-                    let packet_number_int = BigEndian::read_i32(&packet_number);
+                    let initial_packet_number_bytes = &packet_number_calc[4 - packet_num_len..];
+                    let packet_number_int = BigEndian::read_i32(&packet_number_calc);
+                    packet_number = Some(packet_number_int as u32);
                     offset += packet_num_len;
                     // Parse the encrypted payload
                     let tag_len = conn.client_opener.as_ref().unwrap().alg().tag_len();
@@ -349,6 +355,8 @@ impl QuicPacket {
                     token = None;
                     retry_tag = None;
                     decrypted_payload = None;
+                    packet_number_length = None;
+                    packet_number = None;
                     // Parse payload length
                     let packet_len_len = QuicPacket::get_var_len(
                         QuicPacket::access_data(data, offset, offset + 1)?[0],
@@ -364,6 +372,8 @@ impl QuicPacket {
                 LongHeaderPacketType::Retry => {
                     packet_len = None;
                     decrypted_payload = None;
+                    packet_number_length = None;
+                    packet_number = None;
                     if data.len() > (offset + 16) {
                         token_len = Some((data.len() - offset - 16) as u64);
                     } else {
@@ -386,30 +396,41 @@ impl QuicPacket {
 
             let mut frames: Option<Vec<QuicFrame>> = None;
             // Grab the proper buffer for CRYPTO frame data
-            let crypto_buffer: &mut Vec<u8> = if dir {
-                conn.client_buffer.as_mut()
+            let (crypto_map, crypto_buffer): (&mut BTreeMap<usize, Vec<u8>>, &mut Vec<u8>) = if dir {
+                (&mut conn.client_map, &mut conn.client_buffer)
             } else {
-                conn.server_buffer.as_mut()
+                (&mut conn.server_map, &mut conn.server_buffer)
             };
             // If decrypted payload is not None, parse the frames
             if let Some(frame_bytes) = decrypted_payload {
                 // Get frames and reassembled CRYPTO data
                 // Pass the buffer's current length as starting offset for CRYPTO frames
-                let (q_frames, mut crypto_bytes) =
-                    QuicFrame::parse_frames(&frame_bytes, crypto_buffer.len())?;
+                let q_frames =
+                    QuicFrame::parse_frames(&frame_bytes, crypto_map)?;
                 frames = Some(q_frames);
-                if !crypto_bytes.is_empty() {
-                    crypto_buffer.append(&mut crypto_bytes);
+                if !crypto_map.is_empty() {
+                    // Reassemble CRYPTO frames into a single buffer
+                    // let mut reassembled_crypto: Vec<u8> = Vec::new();
+                    let mut expected_offset = crypto_buffer.len();
+                    let mut to_remove = Vec::new();
+                    for (crypto_offset, crypto_data) in crypto_map.iter() {
+                        if *crypto_offset != expected_offset {
+                            break;
+                        }
+                        expected_offset += crypto_data.len();
+                        crypto_buffer.extend_from_slice(crypto_data);
+                        to_remove.push(*crypto_offset);
+                    }
+                    for offset in to_remove {
+                        crypto_map.remove(&offset);
+                    }
                     // Attempt to parse CRYPTO buffer
                     // clear on success
-                    // TODO: This naive buffer will not work for out of order frames
-                    // across packets or multiple messages in the same buffer
-                    match parse_tls_message_handshake(crypto_buffer) {
-                        Ok((_, msg)) => {
-                            conn.tls.parse_message_level(&msg, dir);
-                            crypto_buffer.clear();
-                        }
-                        Err(_) => return Err(QuicError::TlsParseFail),
+                    if let Ok((_, msg)) = parse_tls_message_handshake(crypto_buffer)
+                    {
+                        conn.tls.parse_message_level(&msg, dir);
+                        crypto_buffer.clear();
+                        crypto_map.clear();
                     }
                 }
             }
@@ -431,6 +452,8 @@ impl QuicPacket {
                         retry_tag,
                     }),
                     frames,
+                    packet_number_length,
+                    packet_number,
                 },
                 offset,
             ))
@@ -463,6 +486,8 @@ impl QuicPacket {
                     long_header: None,
                     payload_bytes_count: Some(payload_bytes_count),
                     frames: None,
+                    packet_number_length: None,
+                    packet_number: None,
                 },
                 offset,
             ))
@@ -478,7 +503,9 @@ impl QuicConn {
             tls: Tls::new(),
             client_opener: None,
             server_opener: None,
+            client_map: BTreeMap::new(),
             client_buffer: Vec::new(),
+            server_map: BTreeMap::new(),
             server_buffer: Vec::new(),
         }
     }

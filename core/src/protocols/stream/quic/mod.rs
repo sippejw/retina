@@ -20,20 +20,23 @@ TODO: support parsing the tls out of the initial quic packet setup
 TODO support dns over quic
 TODO: support HTTP/3
 */
-pub(crate) mod parser;
-
-use std::collections::HashSet;
-
-pub use self::header::{QuicLongHeader, QuicShortHeader};
-use crypto::Open;
-use frame::QuicFrame;
-use header::LongHeaderPacketType;
 use serde::Serialize;
 
-use super::tls::Tls;
+use std::collections::{HashSet, BTreeMap};
+
 pub(crate) mod crypto;
 pub(crate) mod frame;
 pub(crate) mod header;
+pub(crate) mod parser;
+pub(crate) mod qtp;
+
+pub use self::header::{QuicLongHeader, QuicShortHeader};
+pub use self::qtp::{QuicTransportParameters, TransportParameter};
+pub use frame::QuicFrame;
+
+use super::tls::Tls;
+use crypto::Open;
+use header::LongHeaderPacketType;
 
 /// Errors Thrown throughout QUIC parsing. These are handled by retina and used to skip packets.
 #[derive(Debug)]
@@ -54,7 +57,7 @@ pub enum QuicError {
 }
 
 /// Parsed Quic connections
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct QuicConn {
     // All packets associated with the connection
     pub packets: Vec<QuicPacket>,
@@ -73,15 +76,21 @@ pub struct QuicConn {
 
     // Client buffer for multi-packet TLS messages
     #[serde(skip_serializing)]
+    pub client_map: BTreeMap<usize, Vec<u8>>,
+
+    #[serde(skip_serializing)]
     pub client_buffer: Vec<u8>,
 
     // Server buffer for multi-packet TLS messages
+    #[serde(skip_serializing)]
+    pub server_map: BTreeMap<usize, Vec<u8>>,
+
     #[serde(skip_serializing)]
     pub server_buffer: Vec<u8>,
 }
 
 /// Parsed Quic Packet contents
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct QuicPacket {
     /// Quic Short header
     pub short_header: Option<QuicShortHeader>,
@@ -91,6 +100,12 @@ pub struct QuicPacket {
 
     /// The number of bytes contained in the estimated payload
     pub payload_bytes_count: Option<u64>,
+
+    // length of the packet number in bytes
+    pub packet_number_length: Option<u8>,
+
+    // packet number converted to u32 (max size of packet number)
+    pub packet_number: Option<u32>,
 
     pub frames: Option<Vec<QuicFrame>>,
 }
