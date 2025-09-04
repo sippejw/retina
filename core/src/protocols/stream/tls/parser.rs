@@ -16,6 +16,7 @@ use super::handshake::{
 use super::Tls;
 use crate::conntrack::pdu::L4Pdu;
 use crate::protocols::stream::quic::qtp::QuicTransportParameters;
+use crate::protocols::stream::tls::EncryptedClientHello;
 use crate::protocols::stream::{
     ConnParsable, ParseResult, ParsingState, ProbeResult, Session, SessionData,
 };
@@ -193,6 +194,15 @@ impl Tls {
                         }
                         TlsExtension::RecordSizeLimit(v) => {
                             client_hello.record_size_limit = Some(v);
+                        }
+                        TlsExtension::EncryptedClientHello { ch_type, ciphersuite, config_id, enc, payload } => {
+                            client_hello.encrypted_client_hello = Some(EncryptedClientHello {
+                                ch_type,
+                                ciphersuite,
+                                config_id,
+                                enc: enc.to_vec(),
+                                payload: payload.to_vec(),
+                            });
                         }
                         TlsExtension::QuicTransportParameters(v) => {
                             client_hello.quic_transport_parameters =

@@ -31,6 +31,7 @@ pub struct ClientHello {
     pub compress_certificate: Vec<u8>,
     pub record_size_limit: Option<u16>,
     pub quic_transport_parameters: Option<QuicTransportParameters>,
+    pub encrypted_client_hello: Option<EncryptedClientHello>,
 }
 
 /// A parsed TLS ServerHello message.
@@ -155,4 +156,16 @@ pub struct KeyShareEntry {
     pub group: NamedGroup,
     #[serde(with = "base64")]
     pub kx_data: Vec<u8>,
+}
+
+/// Encrypted ClientHello message, defined in [draft-ietf-tls-esni].
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct EncryptedClientHello {
+    pub ch_type: u8,
+    pub ciphersuite: u32,
+    pub config_id: u8,
+    #[serde(with = "base64")]
+    pub enc: Vec<u8>,
+    #[serde(with = "base64")]
+    pub payload: Vec<u8>,
 }
