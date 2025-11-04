@@ -435,6 +435,12 @@ impl QuicPacket {
                 }
             }
 
+            let raw = if packet_type == LongHeaderPacketType::Initial {
+                Some(data.to_vec())
+            } else {
+                None
+            };
+
             Ok((
                 QuicPacket {
                     payload_bytes_count: packet_len,
@@ -454,6 +460,7 @@ impl QuicPacket {
                     frames,
                     packet_number_length,
                     packet_number,
+                    raw,
                 },
                 offset,
             ))
@@ -488,6 +495,7 @@ impl QuicPacket {
                     frames: None,
                     packet_number_length: None,
                     packet_number: None,
+                    raw: None,
                 },
                 offset,
             ))

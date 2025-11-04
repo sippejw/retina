@@ -2,6 +2,7 @@ use retina_core::config::load_config;
 use retina_core::{CoreId, FiveTuple, Runtime};
 use retina_datatypes::*;
 use retina_filtergen::{filter, retina_main};
+use retina_core::protocols::stream::quic::header::LongHeaderPacketType;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -87,54 +88,56 @@ struct TlsData {
 struct QuicData {
     pub server_subnet: String,
     pub sni: String,
+    pub packets: Vec<Vec<u8>>,
 }
 
-#[filter("dns and ((tcp and tcp.port != 53) or (udp and udp.port != 53))")]
-fn dns_cb(dns: &DnsTransaction, five_tuple: &FiveTuple, core_id: &CoreId) {
-    let record = ProtoData::Dns(DnsData {
-        server_subnet: five_tuple.dst_ip_str(),
-        transp_proto: five_tuple.transp_proto_str(),
-        query_domain: (*dns).query_domain().to_string(),
-    });
-    let ptr = core_files()[core_id.raw() as usize].load(Ordering::Relaxed);
-    let wtr = unsafe { &mut *ptr };
-    if let Ok(s) = serde_json::to_string(&record) {
-        writeln!(wtr, "{}", s).unwrap();
-    }
-}
+// #[filter("dns and ((tcp and tcp.port != 53) or (udp and udp.port != 53))")]
+// fn dns_cb(dns: &DnsTransaction, five_tuple: &FiveTuple, core_id: &CoreId) {
+//     let record = ProtoData::Dns(DnsData {
+//         server_subnet: five_tuple.dst_ip_str(),
+//         transp_proto: five_tuple.transp_proto_str(),
+//         query_domain: (*dns).query_domain().to_string(),
+//     });
+//     let ptr = core_files()[core_id.raw() as usize].load(Ordering::Relaxed);
+//     let wtr = unsafe { &mut *ptr };
+//     if let Ok(s) = serde_json::to_string(&record) {
+//         writeln!(wtr, "{}", s).unwrap();
+//     }
+// }
 
-#[filter("http and tcp and tcp.port != 80 and tcp.port != 8080")]
-fn http_cb(http: &HttpTransaction, five_tuple: &FiveTuple, core_id: &CoreId) {
-    let txn = ProtoData::Http(HttpData {
-        server_subnet: five_tuple.dst_subnet_str(),
-        uri: (*http).uri().to_string(),
-        host: (*http).host().to_string(),
-    });
-    let ptr = core_files()[core_id.raw() as usize].load(Ordering::Relaxed);
-    let wtr = unsafe { &mut *ptr };
-    if let Ok(s) = serde_json::to_string(&txn) {
-        writeln!(wtr, "{}", s).unwrap();
-    }
-}
+// #[filter("http and tcp and tcp.port != 80 and tcp.port != 8080")]
+// fn http_cb(http: &HttpTransaction, five_tuple: &FiveTuple, core_id: &CoreId) {
+//     let txn = ProtoData::Http(HttpData {
+//         server_subnet: five_tuple.dst_subnet_str(),
+//         uri: (*http).uri().to_string(),
+//         host: (*http).host().to_string(),
+//     });
+//     let ptr = core_files()[core_id.raw() as usize].load(Ordering::Relaxed);
+//     let wtr = unsafe { &mut *ptr };
+//     if let Ok(s) = serde_json::to_string(&txn) {
+//         writeln!(wtr, "{}", s).unwrap();
+//     }
+// }
 
-#[filter("tls and tcp and tcp.port != 443")]
-fn tls_cb(tls: &TlsHandshake, five_tuple: &FiveTuple, core_id: &CoreId) {
-    let hndshk = ProtoData::Tls(TlsData {
-        server_subnet: five_tuple.dst_subnet_str(),
-        sni: (*tls).sni().to_string(),
-    });
-    let ptr = core_files()[core_id.raw() as usize].load(Ordering::Relaxed);
-    let wtr = unsafe { &mut *ptr };
-    if let Ok(s) = serde_json::to_string(&hndshk) {
-        writeln!(wtr, "{}", s).unwrap();
-    }
-}
+// #[filter("tls and tcp and tcp.port != 443")]
+// fn tls_cb(tls: &TlsHandshake, five_tuple: &FiveTuple, core_id: &CoreId) {
+//     let hndshk = ProtoData::Tls(TlsData {
+//         server_subnet: five_tuple.dst_subnet_str(),
+//         sni: (*tls).sni().to_string(),
+//     });
+//     let ptr = core_files()[core_id.raw() as usize].load(Ordering::Relaxed);
+//     let wtr = unsafe { &mut *ptr };
+//     if let Ok(s) = serde_json::to_string(&hndshk) {
+//         writeln!(wtr, "{}", s).unwrap();
+//     }
+// }
 
-#[filter("quic and udp.port != 443")]
+#[filter("quic and udp.port = 443")]
 fn quic_cb(quic: &QuicStream, five_tuple: &FiveTuple, core_id: &CoreId) {
     let data = ProtoData::Quic(QuicData {
         server_subnet: five_tuple.dst_subnet_str(),
         sni: quic.tls.sni().to_string(),
+        packets: quic.packets.iter().map(|p| p.raw.clone().unwrap_or_default()).collect(),
     });
     let ptr = core_files()[core_id.raw() as usize].load(Ordering::Relaxed);
     let wtr = unsafe { &mut *ptr };
@@ -163,7 +166,7 @@ fn combine_results(outfile: &PathBuf) {
     file.write_all(results.as_bytes()).unwrap();
 }
 
-#[retina_main(4)]
+#[retina_main(1)]
 fn main() {
     init();
     let args = Args::parse();

@@ -26,7 +26,7 @@ use std::collections::{HashSet, BTreeMap};
 
 pub(crate) mod crypto;
 pub(crate) mod frame;
-pub(crate) mod header;
+pub mod header;
 pub(crate) mod parser;
 pub(crate) mod qtp;
 
@@ -108,6 +108,8 @@ pub struct QuicPacket {
     pub packet_number: Option<u32>,
 
     pub frames: Option<Vec<QuicFrame>>,
+
+    pub raw: Option<Vec<u8>>,
 }
 
 impl QuicPacket {

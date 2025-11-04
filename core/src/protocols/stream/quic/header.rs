@@ -26,7 +26,7 @@ pub struct QuicShortHeader {
 }
 
 // Long Header Packet Types from RFC 9000 Table 5
-#[derive(Debug, Clone, Serialize, Copy)]
+#[derive(Debug, Clone, Serialize, Copy, PartialEq, Eq)]
 pub enum LongHeaderPacketType {
     Initial,
     ZeroRTT,
