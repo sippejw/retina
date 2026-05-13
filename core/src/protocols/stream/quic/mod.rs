@@ -108,6 +108,10 @@ pub struct QuicPacket {
     pub packet_number: Option<u32>,
 
     pub frames: Option<Vec<QuicFrame>>,
+
+    /// Raw wire bytes for this packet. Populated only for Initial packets.
+    #[serde(skip_serializing)]
+    pub raw_data: Option<Vec<u8>>,
 }
 
 impl QuicPacket {

@@ -198,6 +198,7 @@ impl QuicPacket {
         mut offset: usize,
         dir: bool,
     ) -> Result<(QuicPacket, usize), QuicError> {
+        let start_offset = offset;
         let packet_header_byte = QuicPacket::access_data(data, offset, offset + 1)?[0];
         offset += 1;
         // Check the fixed bit
@@ -454,6 +455,12 @@ impl QuicPacket {
                     frames,
                     packet_number_length,
                     packet_number,
+                    raw_data: match packet_type {
+                        LongHeaderPacketType::Initial => {
+                            Some(data[start_offset..offset].to_vec())
+                        }
+                        _ => None,
+                    },
                 },
                 offset,
             ))
@@ -488,6 +495,7 @@ impl QuicPacket {
                     frames: None,
                     packet_number_length: None,
                     packet_number: None,
+                    raw_data: None,
                 },
                 offset,
             ))
