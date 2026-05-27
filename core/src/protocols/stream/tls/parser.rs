@@ -206,7 +206,7 @@ impl Tls {
                         }
                         TlsExtension::QuicTransportParameters(v) => {
                             client_hello.quic_transport_parameters =
-                                Some(QuicTransportParameters::new(v.to_vec()));
+                                QuicTransportParameters::new(v.to_vec()).ok();
                         }
                         _ => (),
                     }
