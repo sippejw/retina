@@ -1,19 +1,20 @@
 use num_enum::TryFromPrimitive;
 use serde::{Serialize, Deserialize};
-
+use crate::protocols::stream::quic::{QuicError, QuicPacket};
 use std::cmp::Ordering;
 
 // Helper function to decode variable-length integers as defined in RFC 9000 Section 16
 // https://www.rfc-editor.org/rfc/rfc9000#name-variable-length-integer-enc
-fn var_int(i: &[u8]) -> (u64, &[u8]) {
-    let mut v: u64 = i[0] as u64;
+fn var_int(i: &[u8]) -> Result<(u64, &[u8]), QuicError> {
+    let mut v: u64 = QuicPacket::access_data(i, 0, 1)?[0] as u64;
     let prefix = v >> 6;
     let length = 1 << prefix;
     v &= 0x3f;
     for &j in i.iter().take(length).skip(1) {
         v = (v << 8) | j as u64;
     }
-    (v, &i[length..])
+    let result = QuicPacket::access_data(i, length, i.len())?;
+    Ok((v, result))
 }
 
 // Check if a transport parameter ID is a reserved (GREASEd) value.
@@ -225,11 +226,11 @@ pub struct QuicTransportParameters {
 }
 
 impl QuicTransportParameters {
-    pub fn new(data: Vec<u8>) -> Self {
+    pub fn new(data: Vec<u8>) -> Result<Self, QuicError> {
         let mut parameters = Vec::new();
         let mut data = data.as_slice();
         while !data.is_empty() {
-            let (parameter_id, parameter_value, rest) = Self::parse_parameter(data);
+            let (parameter_id, parameter_value, rest) = Self::parse_parameter(data)?;
 
             let parameter = if is_reserved(parameter_id) {
                 TransportParameter::ParameterGrease {
@@ -246,7 +247,7 @@ impl QuicTransportParameters {
                     Ok(TransportParameterId::MaxIdleTimeout) => {
                         TransportParameter::MaxIdleTimeout {
                             value: parameter_value.to_vec(),
-                            max_idle_timeout: var_int(parameter_value).0,
+                            max_idle_timeout: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::StatelessResetToken) => {
@@ -255,54 +256,54 @@ impl QuicTransportParameters {
                     Ok(TransportParameterId::MaxUdpPayloadSize) => {
                         TransportParameter::MaxUdpPayloadSize {
                             value: parameter_value.to_vec(),
-                            max_udp_payload_size: var_int(parameter_value).0,
+                            max_udp_payload_size: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::InitialMaxData) => {
                         TransportParameter::InitialMaxData {
                             value: parameter_value.to_vec(),
-                            initial_max_data: var_int(parameter_value).0,
+                            initial_max_data: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::InitialMaxStreamDataBidiLocal) => {
                         TransportParameter::InitialMaxStreamDataBidiLocal {
                             value: parameter_value.to_vec(),
-                            initial_max_stream_data_bidi_local: var_int(parameter_value).0,
+                            initial_max_stream_data_bidi_local: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::InitialMaxStreamDataBidiRemote) => {
                         TransportParameter::InitialMaxStreamDataBidiRemote {
                             value: parameter_value.to_vec(),
-                            initial_max_stream_data_bidi_remote: var_int(parameter_value).0,
+                            initial_max_stream_data_bidi_remote: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::InitialMaxStreamDataUni) => {
                         TransportParameter::InitialMaxStreamDataUni {
                             value: parameter_value.to_vec(),
-                            initial_max_stream_data_uni: var_int(parameter_value).0,
+                            initial_max_stream_data_uni: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::InitialMaxStreamsBidi) => {
                         TransportParameter::InitialMaxStreamsBidi {
                             value: parameter_value.to_vec(),
-                            initial_max_streams_bidi: var_int(parameter_value).0,
+                            initial_max_streams_bidi: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::InitialMaxStreamsUni) => {
                         TransportParameter::InitialMaxStreamsUni {
                             value: parameter_value.to_vec(),
-                            initial_max_streams_uni: var_int(parameter_value).0,
+                            initial_max_streams_uni: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::AckDelayExponent) => {
                         TransportParameter::AckDelayExponent {
                             value: parameter_value.to_vec(),
-                            ack_delay_exponent: var_int(parameter_value).0,
+                            ack_delay_exponent: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::MaxAckDelay) => TransportParameter::MaxAckDelay {
                         value: parameter_value.to_vec(),
-                        max_ack_delay: var_int(parameter_value).0,
+                        max_ack_delay: var_int(parameter_value)?.0,
                     },
                     Ok(TransportParameterId::DisableActiveMigration) => {
                         TransportParameter::DisableActiveMigration
@@ -313,7 +314,7 @@ impl QuicTransportParameters {
                     Ok(TransportParameterId::ActiveConnectionIdLimit) => {
                         TransportParameter::ActiveConnectionIdLimit {
                             value: parameter_value.to_vec(),
-                            active_connection_id_limit: var_int(parameter_value).0,
+                            active_connection_id_limit: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::InitialSourceConnectionId) => {
@@ -338,7 +339,7 @@ impl QuicTransportParameters {
                     Ok(TransportParameterId::MaxDatagramFrameSize) => {
                         TransportParameter::MaxDatagramFrameSize {
                             value: parameter_value.to_vec(),
-                            max_datagram_frame_size: var_int(parameter_value).0,
+                            max_datagram_frame_size: var_int(parameter_value)?.0,
                         }
                     }
                     Ok(TransportParameterId::GreaseQuicBit) => TransportParameter::GreaseQuicBit,
@@ -360,15 +361,15 @@ impl QuicTransportParameters {
             parameters.push(parameter);
             data = rest;
         }
-        QuicTransportParameters { parameters }
+        Ok(QuicTransportParameters { parameters })
     }
 
     // Parses the parameter ID, parameter length, and parameter value(s) from the given data slice.
-    fn parse_parameter(data: &[u8]) -> (u64, &[u8], &[u8]) {
-        let (parameter_id, data) = var_int(data);
-        let (parameter_len, data) = var_int(data);
+    fn parse_parameter(data: &[u8]) -> Result<(u64, &[u8], &[u8]), QuicError> {
+        let (parameter_id, data) = var_int(data)?;
+        let (parameter_len, data) = var_int(data)?;
         let parameter_value = &data[..parameter_len as usize];
         let rest = &data[parameter_len as usize..];
-        (parameter_id, parameter_value, rest)
+        Ok((parameter_id, parameter_value, rest))
     }
 }

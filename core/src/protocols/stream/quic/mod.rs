@@ -54,6 +54,7 @@ pub enum QuicError {
     UnknownFrameType,
     TlsParseFail,
     MissingCryptoFrames,
+    QTPParseError,
 }
 
 /// Parsed Quic connections
