@@ -162,6 +162,14 @@ impl RuntimeConfig {
                 eal_params.push("-a".to_owned());
                 eal_params.push(port.device.to_string());
             }
+        } else {
+            // Offline: no NIC and no DMA. Disable the PCI bus so EAL does not
+            // probe (and fail on) the host's NICs in containers/CI — e.g. mlx5
+            // on cloud runners, virtio in VMs — and force IOVA=VA, since PA mode
+            // needs physical addresses that VMs don't expose (the mempool fails
+            // to allocate otherwise).
+            eal_params.push("--no-pci".to_owned());
+            eal_params.push("--iova-mode=va".to_owned());
         }
 
         eal_params.push("-n".to_owned());
