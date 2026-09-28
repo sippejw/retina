@@ -54,6 +54,16 @@ impl ConnParsable for QuicParser {
         }
     }
 
+    /// Probes for QUIC.
+    ///
+    /// Only a long header carrying a known, non-zero version and an Initial
+    /// packet type is `Certain`. Version 0 (`QuicVersion::ReservedNegotiation`)
+    /// is deliberately not enough: a client never sends it, so a version-0
+    /// packet can only be a server's Version Negotiation reply. Treating it as
+    /// certain let NTP requests with LI=3 (e.g. `e3 00 00 00 00 …`, the classic
+    /// minimal SNTP request, whose first byte has the fixed bit set and whose
+    /// next four bytes are zero) probe as QUIC; such flows never yield a short
+    /// header, so the resulting QUIC session accumulated packets forever.
     fn probe(&self, pdu: &L4Pdu) -> ProbeResult {
         if pdu.length() < 5 {
             return ProbeResult::Unsure;
@@ -63,31 +73,7 @@ impl ConnParsable for QuicParser {
         let length = pdu.length();
 
         if let Ok(data) = (pdu.mbuf).get_data_slice(offset, length) {
-            // Check if Fixed Bit is set
-            if (data[0] & 0x40) == 0 {
-                return ProbeResult::NotForUs;
-            }
-
-            if (data[0] & 0x80) != 0 {
-                // Potential Long Header
-                if data.len() < 6 {
-                    return ProbeResult::Unsure;
-                }
-
-                // Check if version is known
-                // An unknown version must be handled as
-                // a potential QUIC packet due to Version Negotiation
-                let version = ((data[1] as u32) << 24)
-                    | ((data[2] as u32) << 16)
-                    | ((data[3] as u32) << 8)
-                    | (data[4] as u32);
-                match QuicVersion::from_u32(version) {
-                    QuicVersion::Unknown => ProbeResult::Unsure,
-                    _ => ProbeResult::Certain,
-                }
-            } else {
-                ProbeResult::Unsure
-            }
+            QuicParser::probe_bytes(data)
         } else {
             log::warn!("Malformed packet");
             ProbeResult::Error
@@ -113,6 +99,54 @@ impl ConnParsable for QuicParser {
 
     fn session_parsed_state(&self) -> ParsingState {
         ParsingState::Parsing
+    }
+}
+
+impl QuicParser {
+    /// Probe logic on the UDP payload; see [`ConnParsable::probe`]. `data` is
+    /// at least 5 bytes.
+    fn probe_bytes(data: &[u8]) -> ProbeResult {
+        // A Version Negotiation packet (long header, version 0) is the
+        // server's reply to the client's real Initial; the fixed bit is
+        // unused in VN packets (RFC 9000 §17.2.1) and some servers clear
+        // it. Keep probing so the retried Initial is still seen.
+        if (data[0] & 0x80) != 0 && data[1..5] == [0, 0, 0, 0] {
+            return ProbeResult::Unsure;
+        }
+
+        // Check if Fixed Bit is set
+        if (data[0] & 0x40) == 0 {
+            return ProbeResult::NotForUs;
+        }
+
+        if (data[0] & 0x80) != 0 {
+            // Potential Long Header
+            if data.len() < 6 {
+                return ProbeResult::Unsure;
+            }
+
+            // Check if version is known
+            // An unknown version must be handled as
+            // a potential QUIC packet due to Version Negotiation
+            let version = ((data[1] as u32) << 24)
+                | ((data[2] as u32) << 16)
+                | ((data[3] as u32) << 8)
+                | (data[4] as u32);
+            match QuicVersion::from_u32(version) {
+                QuicVersion::Unknown | QuicVersion::ReservedNegotiation => ProbeResult::Unsure,
+                // Known version: only be certain on an Initial packet.
+                // The type bits are decoded with the v1 table (as in
+                // `parse_from`), so QUIC v2 (RFC 9369, whose Initial type
+                // is 0b01) stays Unsure; v2 was never fingerprinted since
+                // `parse_from` cannot decrypt it either.
+                _ => match LongHeaderPacketType::from_u8((data[0] & 0x30) >> 4) {
+                    Ok(LongHeaderPacketType::Initial) => ProbeResult::Certain,
+                    _ => ProbeResult::Unsure,
+                },
+            }
+        } else {
+            ProbeResult::Unsure
+        }
     }
 }
 
@@ -411,20 +445,7 @@ impl QuicPacket {
                 frames = Some(q_frames);
                 if !crypto_map.is_empty() {
                     // Reassemble CRYPTO frames into a single buffer
-                    // let mut reassembled_crypto: Vec<u8> = Vec::new();
-                    let mut expected_offset = crypto_buffer.len();
-                    let mut to_remove = Vec::new();
-                    for (crypto_offset, crypto_data) in crypto_map.iter() {
-                        if *crypto_offset != expected_offset {
-                            break;
-                        }
-                        expected_offset += crypto_data.len();
-                        crypto_buffer.extend_from_slice(crypto_data);
-                        to_remove.push(*crypto_offset);
-                    }
-                    for offset in to_remove {
-                        crypto_map.remove(&offset);
-                    }
+                    reassemble_crypto(crypto_map, crypto_buffer);
                     // Attempt to parse CRYPTO buffer
                     // clear on success
                     if let Ok((_, msg)) = parse_tls_message_handshake(crypto_buffer)
@@ -503,7 +524,42 @@ impl QuicPacket {
     }
 }
 
+/// Move the in-order CRYPTO fragments from `crypto_map` onto the end of
+/// `crypto_buffer`. Fragments that only repeat data already in the buffer
+/// (retransmissions of consumed offsets) are dropped, and a fragment that
+/// overlaps the tail of the buffer contributes only its new bytes; otherwise a
+/// retransmitted first fragment would sit at the head of the map forever and
+/// block every fragment queued behind it.
+fn reassemble_crypto(crypto_map: &mut BTreeMap<usize, Vec<u8>>, crypto_buffer: &mut Vec<u8>) {
+    let mut expected_offset = crypto_buffer.len();
+    let mut to_remove = Vec::new();
+    for (crypto_offset, crypto_data) in crypto_map.iter() {
+        let end = *crypto_offset + crypto_data.len();
+        if end <= expected_offset {
+            to_remove.push(*crypto_offset);
+            continue;
+        }
+        if *crypto_offset > expected_offset {
+            break;
+        }
+        crypto_buffer.extend_from_slice(&crypto_data[expected_offset - *crypto_offset..]);
+        expected_offset = end;
+        to_remove.push(*crypto_offset);
+    }
+    for offset in to_remove {
+        crypto_map.remove(&offset);
+    }
+}
+
 impl QuicConn {
+    /// Upper bound on the number of packets tracked per connection.
+    ///
+    /// A real handshake's long-header packets are well under this. A flow that
+    /// never yields a short header (misdetected protocol, long-header-only
+    /// flow) would otherwise grow `QuicConn.packets` without bound — observed
+    /// at 262k+ packets / 56 MiB per connection in production.
+    pub const MAX_TRACKED_PACKETS: usize = 128;
+
     pub(crate) fn new() -> QuicConn {
         QuicConn {
             packets: Vec::new(),
@@ -520,6 +576,7 @@ impl QuicConn {
 
     fn parse_packet(&mut self, data: &[u8], direction: bool) -> ParseResult {
         let mut offset = 0;
+        let mut parse_error = false;
         // Iterate over all of the data in the datagram
         // Parse as many QUIC packets as possible
         // TODO: identify padding appended to datagram
@@ -528,7 +585,10 @@ impl QuicConn {
                 self.packets.push(quic);
                 offset = off;
             } else {
-                return ParseResult::Skipped;
+                // Fall through to the Done checks so a datagram that fails to
+                // parse can still finish the session
+                parse_error = true;
+                break;
             }
         }
         if self
@@ -538,6 +598,119 @@ impl QuicConn {
         {
             return ParseResult::Done(0);
         }
+        // Client's first flight fully parsed: deliver now and drop the
+        // per-connection parser state
+        #[cfg(feature = "client_hello_done")]
+        if self
+            .tls
+            .client_hello
+            .as_ref()
+            .is_some_and(|ch| ch.quic_transport_parameters.is_some())
+        {
+            return ParseResult::Done(0);
+        }
+        // Bound memory: deliver whatever was collected. The subscriber ignores
+        // sessions without a ClientHello, and remove_session pops the session
+        // so nothing further accumulates.
+        if self.packets.len() >= Self::MAX_TRACKED_PACKETS {
+            return ParseResult::Done(0);
+        }
+        if parse_error {
+            return ParseResult::Skipped;
+        }
         ParseResult::Continue(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal SNTP request with LI=3: `e3` followed by zeros (48 bytes).
+    fn ntp_request(first: u8) -> Vec<u8> {
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = first;
+        pkt
+    }
+
+    #[test]
+    fn probe_rejects_ntp_lookalikes() {
+        // LI=3, VN=4, mode 3 and LI=3, VN=3, mode 3: long header + version 0
+        for first in [0xe3, 0xdb] {
+            assert_eq!(
+                QuicParser::probe_bytes(&ntp_request(first)),
+                ProbeResult::Unsure
+            );
+        }
+    }
+
+    #[test]
+    fn probe_is_certain_only_for_initial_with_known_version() {
+        // v1 Initial: 0b1100_0000 | type 00
+        let initial = [0xc3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(QuicParser::probe_bytes(&initial), ProbeResult::Certain);
+        // v1 Handshake (type 0b10) and 0-RTT (0b01) first: not a session start
+        let handshake = [0xe3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 0];
+        assert_eq!(QuicParser::probe_bytes(&handshake), ProbeResult::Unsure);
+        let zero_rtt = [0xd3, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 0];
+        assert_eq!(QuicParser::probe_bytes(&zero_rtt), ProbeResult::Unsure);
+        // Unknown (GREASE) version keeps probing
+        let grease = [0xc9, 0xba, 0xba, 0xba, 0xba, 0x08, 0, 0];
+        assert_eq!(QuicParser::probe_bytes(&grease), ProbeResult::Unsure);
+        // Version Negotiation with the fixed bit clear keeps probing too
+        let vn = [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0];
+        assert_eq!(QuicParser::probe_bytes(&vn), ProbeResult::Unsure);
+        // Short-header-looking payloads stay Unsure, others NotForUs
+        assert_eq!(QuicParser::probe_bytes(&[0x41, 1, 2, 3, 4, 5]), ProbeResult::Unsure);
+        assert_eq!(QuicParser::probe_bytes(&[0x23, 0, 0, 0, 0, 0]), ProbeResult::NotForUs);
+    }
+
+    #[test]
+    fn packet_tracking_is_bounded() {
+        // A long-header-only flow that never yields a short header (each
+        // datagram parses one packet and then fails on the trailing zeros)
+        // must finish the session at the cap instead of growing forever.
+        let mut conn = QuicConn::new();
+        let pkt = ntp_request(0xe3);
+        let mut done_at = None;
+        for i in 0..(QuicConn::MAX_TRACKED_PACKETS * 4) {
+            match conn.parse_packet(&pkt, true) {
+                ParseResult::Done(_) => {
+                    done_at = Some(i);
+                    break;
+                }
+                ParseResult::Skipped | ParseResult::Continue(_) => {}
+                ParseResult::None => panic!("unexpected None"),
+            }
+        }
+        assert_eq!(done_at, Some(QuicConn::MAX_TRACKED_PACKETS - 1));
+        assert_eq!(conn.packets.len(), QuicConn::MAX_TRACKED_PACKETS);
+    }
+
+    #[test]
+    fn retransmitted_crypto_fragment_does_not_stall_reassembly() {
+        let mut buffer: Vec<u8> = vec![1; 1180]; // fragment 0..1180 already consumed
+        let mut map = BTreeMap::new();
+        map.insert(0, vec![1; 1180]); // retransmission of the consumed fragment
+        map.insert(1180, vec![2; 520]); // the fragment that was missing
+        reassemble_crypto(&mut map, &mut buffer);
+        assert_eq!(buffer.len(), 1700);
+        assert!(map.is_empty());
+
+        // Overlapping tail: only the new bytes are appended
+        let mut buffer: Vec<u8> = vec![1; 1000];
+        let mut map = BTreeMap::new();
+        map.insert(800, [vec![1; 200], vec![3; 100]].concat());
+        reassemble_crypto(&mut map, &mut buffer);
+        assert_eq!(buffer.len(), 1100);
+        assert_eq!(&buffer[1000..], &[3u8; 100][..]);
+
+        // A gap still waits for the missing fragment
+        let mut buffer: Vec<u8> = vec![1; 100];
+        let mut map = BTreeMap::new();
+        map.insert(200, vec![4; 50]);
+        reassemble_crypto(&mut map, &mut buffer);
+        assert_eq!(buffer.len(), 100);
+        assert_eq!(map.len(), 1);
     }
 }

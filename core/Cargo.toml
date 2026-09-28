@@ -73,4 +73,10 @@ prometheus = [
     "dep:http-body-util",
 ]
 mlx5 = []
+# Finish a QUIC/TLS session as soon as the ClientHello (and, for QUIC, its
+# transport parameters) has been parsed, delivering it immediately and dropping
+# per-connection parser state; the delivered session then contains only the
+# client's first flight. Cuts per-connection memory and, for TCP, stops
+# reassembly/out-of-order mbuf buffering after the ClientHello.
+client_hello_done = []
 default = []

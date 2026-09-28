@@ -111,6 +111,9 @@ impl Tls {
             client_certificates: vec![],
             server_key_exchange: None,
             client_key_exchange: None,
+            raw_data: vec![],
+            raw_data_len: 0,
+            raw_data_overflow: false,
             state: TlsState::None,
             tcp_buffer: vec![],
             record_buffer: vec![],
@@ -405,6 +408,10 @@ impl Tls {
             TlsMessage::Handshake(ref m) => match *m {
                 TlsMessageHandshake::ClientHello(ref content) => {
                     self.parse_handshake_clienthello(content);
+                    // Client's first flight parsed: deliver now and drop the
+                    // per-connection parser state
+                    #[cfg(feature = "client_hello_done")]
+                    return ParseResult::Done(0);
                 }
                 TlsMessageHandshake::ServerHello(ref content) => {
                     self.parse_handshake_serverhello(content);
@@ -515,6 +522,23 @@ impl Tls {
             log::trace!("TLS session encrypted, activating bypass");
             return ParseResult::Done(0);
         };
+        // Keep the raw client -> server segments until the ClientHello has been parsed
+        // (direction == true is originator -> responder, i.e. client -> server, as TCP
+        // connections are only created on SYN). Once either cap would be exceeded the
+        // capture is abandoned for good and what was stored is released, so `raw_data`
+        // is either the complete contiguous prefix or empty.
+        if direction && self.client_hello.is_none() && !self.raw_data_overflow {
+            if self.raw_data_len + data.len() <= Tls::MAX_RAW_DATA
+                && self.raw_data.len() < Tls::MAX_RAW_SEGMENTS
+            {
+                self.raw_data_len += data.len();
+                self.raw_data.push(data.to_vec());
+            } else {
+                self.raw_data_overflow = true;
+                self.raw_data_len = 0;
+                self.raw_data = vec![];
+            }
+        }
         // Check if TCP data is being defragmented
         let tcp_buffer = match self.tcp_buffer.len() {
             0 => data,
@@ -555,5 +579,53 @@ impl Tls {
             }
         }
         status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A TLS-record-shaped segment that never completes a handshake message
+    /// (handshake record header announcing more bytes than delivered).
+    fn partial_record(len: usize) -> Vec<u8> {
+        let mut seg = vec![0x16, 0x03, 0x01, 0xff, 0xff];
+        seg.resize(len, 0);
+        seg
+    }
+
+    #[test]
+    fn raw_data_keeps_client_segments_until_client_hello() {
+        let mut tls = Tls::new();
+        tls.parse_tcp_level(&partial_record(1400), true);
+        tls.parse_tcp_level(&partial_record(1400), false); // server side is never kept
+        tls.parse_tcp_level(&partial_record(300), true);
+        assert_eq!(tls.raw_data.len(), 2);
+        assert_eq!(tls.raw_data_len, 1700);
+    }
+
+    #[test]
+    fn raw_data_is_dropped_entirely_when_a_cap_is_exceeded() {
+        // Byte cap: the segment that would cross 64 KiB discards everything.
+        let mut tls = Tls::new();
+        for _ in 0..46 {
+            tls.parse_tcp_level(&partial_record(1400), true);
+        }
+        assert_eq!(tls.raw_data.len(), 46);
+        tls.parse_tcp_level(&partial_record(1400), true); // 47 × 1400 > 65536
+        assert!(tls.raw_data.is_empty());
+        assert!(tls.raw_data_overflow);
+        tls.parse_tcp_level(&partial_record(10), true); // sticky
+        assert!(tls.raw_data.is_empty());
+
+        // Segment-count cap: a trickle of tiny segments stops at MAX_RAW_SEGMENTS.
+        let mut tls = Tls::new();
+        for _ in 0..Tls::MAX_RAW_SEGMENTS {
+            tls.parse_tcp_level(&partial_record(6), true);
+        }
+        assert_eq!(tls.raw_data.len(), Tls::MAX_RAW_SEGMENTS);
+        tls.parse_tcp_level(&partial_record(6), true);
+        assert!(tls.raw_data.is_empty());
+        assert!(tls.raw_data_overflow);
     }
 }

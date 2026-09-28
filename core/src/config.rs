@@ -170,6 +170,11 @@ impl RuntimeConfig {
             // to allocate otherwise).
             eal_params.push("--no-pci".to_owned());
             eal_params.push("--iova-mode=va".to_owned());
+            // Offline runs need no shared DPDK config/hugetlbfs files, and
+            // in-memory mode lets tests/offline analysis run on a host where
+            // another DPDK primary process (the live capture) is already
+            // running.
+            eal_params.push("--in-memory".to_owned());
         }
 
         eal_params.push("-n".to_owned());

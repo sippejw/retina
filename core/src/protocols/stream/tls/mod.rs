@@ -33,6 +33,20 @@ pub struct Tls {
     /// ClientKeyExchange message (TLS 1.2 or earlier).
     pub client_key_exchange: Option<ClientKeyExchange>,
 
+    /// Raw TCP payloads, in reassembled order, of the client→server segments observed up to and
+    /// including the one that completes the ClientHello, so the ClientHello as sent on the wire
+    /// can be reconstructed. Empty if the capture was abandoned because it exceeded
+    /// `MAX_RAW_DATA` bytes or `MAX_RAW_SEGMENTS` segments before a ClientHello was parsed, so a
+    /// non-empty value is always the complete, contiguous prefix of the client's stream.
+    #[serde(skip_serializing)]
+    pub raw_data: Vec<Vec<u8>>,
+    /// Bytes currently held in `raw_data`.
+    #[serde(skip)]
+    raw_data_len: usize,
+    /// Set once `raw_data` capture has been abandoned (cap exceeded).
+    #[serde(skip)]
+    raw_data_overflow: bool,
+
     /// TLS state.
     #[serde(skip)]
     state: TlsState,
@@ -47,6 +61,13 @@ pub struct Tls {
 }
 
 impl Tls {
+    /// Maximum total number of bytes kept in `raw_data` (64 KiB).
+    pub const MAX_RAW_DATA: usize = 65_536;
+    /// Maximum number of segments kept in `raw_data`. A ClientHello spans a
+    /// handful of MSS-sized segments; this bounds the allocation count for
+    /// flows that trickle tiny segments without ever completing one.
+    pub const MAX_RAW_SEGMENTS: usize = 64;
+
     /// Returns the version identifier specified in the ClientHello, or `0` if no ClientHello was
     /// observed in the handshake.
     ///
