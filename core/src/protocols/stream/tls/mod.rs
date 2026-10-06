@@ -50,14 +50,19 @@ pub struct Tls {
     /// TLS state.
     #[serde(skip)]
     state: TlsState,
-    /// TCP chunks defragmentation buffer. Defragments TCP segments that arrive over multiple
-    /// packets.
+    /// Set once the first record of the client's TCP stream has been parsed, or its first bytes
+    /// did not parse as a record. A ClientHello is only taken from that first record.
     #[serde(skip)]
-    tcp_buffer: Vec<u8>,
-    /// TLS record defragmentation buffer. Defragments TLS records that arrive over multiple
-    /// segments.
+    client_first_record_parsed: bool,
+    /// TCP chunks defragmentation buffers. Defragments TCP segments that arrive over multiple
+    /// packets. One per direction, indexed by `direction as usize` (1 = client to server), so
+    /// that a message is never completed with bytes from the other side of the connection.
     #[serde(skip)]
-    record_buffer: Vec<u8>,
+    tcp_buffer: [Vec<u8>; 2],
+    /// TLS record defragmentation buffers. Defragments TLS records that arrive over multiple
+    /// segments. One per direction, indexed like `tcp_buffer`.
+    #[serde(skip)]
+    record_buffer: [Vec<u8>; 2],
 }
 
 impl Tls {

@@ -77,6 +77,8 @@ mlx5 = []
 # transport parameters) has been parsed, delivering it immediately and dropping
 # per-connection parser state; the delivered session then contains only the
 # client's first flight. Cuts per-connection memory and, for TCP, stops
-# reassembly/out-of-order mbuf buffering after the ClientHello.
+# reassembly/out-of-order mbuf buffering after the ClientHello. A TCP session
+# whose server sends its ServerHello before a ClientHello was parsed (part of
+# the ClientHello was not captured) also finishes then, without a ClientHello.
 client_hello_done = []
 default = []

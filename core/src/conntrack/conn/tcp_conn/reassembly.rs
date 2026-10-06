@@ -94,9 +94,10 @@ impl TcpFlow {
                 drop(segment);
             }
         } else {
-            // expecting SYNACK in response to the originator's SYN
+            // expecting SYNACK in response to the originator's SYN, or the responder's first
+            // ACK if the SYNACK was not captured
             if segment.flags() & (SYN | ACK) != 0 {
-                let expected_seq = cur_seq.wrapping_add(1 + length);
+                let expected_seq = first_next_seq(segment.flags(), cur_seq, length);
                 self.next_seq = Some(expected_seq);
                 self.consumed_flags |= segment.flags();
                 self.last_ack = Some(segment.ack_no());
@@ -237,6 +238,14 @@ impl OutOfOrderBuffer {
     }
 }
 
+/// Next expected sequence number after the first segment of a flow. Only a SYN occupies a
+/// sequence number: when the flow starts at a plain ACK because the SYNACK was missed,
+/// counting one would drop the first byte of the stream.
+fn first_next_seq(flags: u8, seq: u32, length: u32) -> u32 {
+    let syn = u32::from(flags & SYN != 0);
+    seq.wrapping_add(syn + length)
+}
+
 pub fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
     // From RFC1323:
     //     TCP determines if a data segment is "old" or "new" by testing
@@ -269,5 +278,25 @@ fn overlap(segment: &mut L4Pdu, expected_seq: u32) -> Option<u32> {
         Some(end_seq)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::packet::tcp::PSH;
+
+    #[test]
+    fn flow_seeded_by_syn_ack_skips_the_syn() {
+        assert_eq!(first_next_seq(SYN | ACK, 5_000_000, 0), 5_000_001);
+    }
+
+    #[test]
+    fn flow_seeded_without_syn_ack_keeps_first_byte() {
+        // SYNACK missed and the server's first packet is a pure ACK at ISN+1: expecting ISN+2
+        // would trim the first byte (0x16) of the ServerHello as already seen
+        assert_eq!(first_next_seq(ACK, 5_000_001, 0), 5_000_001);
+        // SYNACK missed and the server's first packet carries data
+        assert_eq!(first_next_seq(ACK | PSH, 5_000_001, 1460), 5_001_461);
     }
 }

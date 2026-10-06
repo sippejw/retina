@@ -115,13 +115,16 @@ impl Tls {
             raw_data_len: 0,
             raw_data_overflow: false,
             state: TlsState::None,
-            tcp_buffer: vec![],
-            record_buffer: vec![],
+            client_first_record_parsed: false,
+            tcp_buffer: [vec![], vec![]],
+            record_buffer: [vec![], vec![]],
         }
     }
 
-    /// Parse a ClientHello message.
-    pub(crate) fn parse_handshake_clienthello(&mut self, content: &TlsClientHelloContents) {
+    /// Parse a ClientHello message. Returns `false`, leaving `client_hello` unset, if its
+    /// extension block does not parse completely: such a ClientHello is truncated or was
+    /// completed with bytes that do not belong to it.
+    pub(crate) fn parse_handshake_clienthello(&mut self, content: &TlsClientHelloContents) -> bool {
         let mut client_hello = ClientHello {
             version: content.version,
             random: content.random.to_vec(),
@@ -138,8 +141,11 @@ impl Tls {
         log::trace!("client extensions: {:#?}", ext);
         match &ext {
             Ok((rem, ref ext_lst)) => {
+                // tls-parser stops at the first extension that fails to parse and returns the
+                // rest unparsed
                 if !rem.is_empty() {
-                    log::debug!("warn: extensions not entirely parsed");
+                    log::debug!("ClientHello extensions not entirely parsed, ignoring it");
+                    return false;
                 }
                 for extension in ext_lst {
                     client_hello
@@ -215,9 +221,16 @@ impl Tls {
                     }
                 }
             }
-            e => log::debug!("Could not parse extensions: {:?}", e),
+            e => {
+                log::debug!(
+                    "Could not parse ClientHello extensions, ignoring it: {:?}",
+                    e
+                );
+                return false;
+            }
         };
         self.client_hello = Some(client_hello);
+        true
     }
 
     /// Parse a ServerHello message.
@@ -406,15 +419,32 @@ impl Tls {
         // extract variables
         match *msg {
             TlsMessage::Handshake(ref m) => match *m {
-                TlsMessageHandshake::ClientHello(ref content) => {
-                    self.parse_handshake_clienthello(content);
-                    // Client's first flight parsed: deliver now and drop the
-                    // per-connection parser state
-                    #[cfg(feature = "client_hello_done")]
-                    return ParseResult::Done(0);
+                // Keep only the client's first ClientHello, the first record of its TCP stream:
+                // one parsed from server bytes is not the client's, and a later one (after a
+                // HelloRetryRequest) must neither replace the first nor stand in for it when the
+                // first could not be parsed
+                TlsMessageHandshake::ClientHello(ref content)
+                    if direction
+                        && self.client_hello.is_none()
+                        && !self.client_first_record_parsed =>
+                {
+                    if self.parse_handshake_clienthello(content) {
+                        // Client's first flight parsed: deliver now and drop the
+                        // per-connection parser state
+                        #[cfg(feature = "client_hello_done")]
+                        return ParseResult::Done(0);
+                    }
                 }
                 TlsMessageHandshake::ServerHello(ref content) => {
                     self.parse_handshake_serverhello(content);
+                    // The server answered a ClientHello that was not parsed (part of it was
+                    // missed or it was rejected), so none will come: stop rather than keep
+                    // tracking the connection, whose missing client bytes would leave every
+                    // later client segment waiting in reassembly
+                    #[cfg(feature = "client_hello_done")]
+                    if !direction && self.client_hello.is_none() {
+                        return ParseResult::Done(0);
+                    }
                 }
                 TlsMessageHandshake::Certificate(ref content) => {
                     self.parse_handshake_certificate(content, direction);
@@ -467,15 +497,16 @@ impl Tls {
         }
 
         // Check if a record is being defragmented
-        let record_buffer = match self.record_buffer.len() {
+        let dir = direction as usize;
+        let record_buffer = match self.record_buffer[dir].len() {
             0 => record.data,
             _ => {
                 // sanity check vector length to avoid memory exhaustion maximum length may be 2^24
                 // (handshake message)
-                if self.record_buffer.len() + record.data.len() > 16_777_216 {
+                if self.record_buffer[dir].len() + record.data.len() > 16_777_216 {
                     return ParseResult::Skipped;
                 };
-                v = self.record_buffer.split_off(0);
+                v = self.record_buffer[dir].split_off(0);
                 v.extend_from_slice(record.data);
                 v.as_slice()
             }
@@ -484,7 +515,27 @@ impl Tls {
         // TODO: record may be compressed Parse record contents as plaintext
         match parse_tls_record_with_header(record_buffer, &record.hdr) {
             Ok((rem, ref msg_list)) => {
+                // Handshake messages lie back to back: a 1-byte type, a 3-byte body length,
+                // then the body
+                let mut handshake_msgs = record_buffer;
                 for msg in msg_list {
+                    if let TlsMessage::Handshake(ref m) = *msg {
+                        let body_len = u32::from_be_bytes([
+                            0,
+                            handshake_msgs[1],
+                            handshake_msgs[2],
+                            handshake_msgs[3],
+                        ]) as usize;
+                        handshake_msgs = &handshake_msgs[4 + body_len..];
+                        // tls-parser ignores ClientHello bytes it could not parse, e.g. an
+                        // extension block whose length overruns the message (ext=None)
+                        if let TlsMessageHandshake::ClientHello(ref content) = *m {
+                            if client_hello_len(content) != body_len {
+                                log::debug!("ClientHello not entirely parsed, ignoring it");
+                                continue;
+                            }
+                        }
+                    }
                     status = self.parse_message_level(msg, direction);
                     if status != ParseResult::Continue(0) {
                         return status;
@@ -499,7 +550,7 @@ impl Tls {
                     "Defragmentation required (TLS record), missing {:?} bytes",
                     needed
                 );
-                self.record_buffer.extend_from_slice(record.data);
+                self.record_buffer[dir].extend_from_slice(record.data);
             }
             Err(_e) => {
                 log::debug!("warn: parse_tls_record_with_header failed");
@@ -514,8 +565,9 @@ impl Tls {
     pub(crate) fn parse_tcp_level(&mut self, data: &[u8], direction: bool) -> ParseResult {
         let mut v: Vec<u8>;
         let mut status = ParseResult::Continue(0);
+        let dir = direction as usize;
         log::trace!("parse_tcp_level ({} bytes)", data.len());
-        log::trace!("defrag buffer size: {}", self.tcp_buffer.len());
+        log::trace!("defrag buffer size: {}", self.tcp_buffer[dir].len());
 
         // do not parse if session is encrypted
         if self.state == TlsState::ClientChangeCipherSpec {
@@ -539,16 +591,17 @@ impl Tls {
                 self.raw_data = vec![];
             }
         }
-        // Check if TCP data is being defragmented
-        let tcp_buffer = match self.tcp_buffer.len() {
+        // Check if TCP data is being defragmented. Each direction has its own buffer, so a
+        // record split across segments is only ever completed with bytes from the same side.
+        let tcp_buffer = match self.tcp_buffer[dir].len() {
             0 => data,
             _ => {
                 // sanity check vector length to avoid memory exhaustion maximum length may be 2^24
                 // (handshake message)
-                if self.tcp_buffer.len() + data.len() > 16_777_216 {
+                if self.tcp_buffer[dir].len() + data.len() > 16_777_216 {
                     return ParseResult::Skipped;
                 };
-                v = self.tcp_buffer.split_off(0);
+                v = self.tcp_buffer[dir].split_off(0);
                 v.extend_from_slice(data);
                 v.as_slice()
             }
@@ -560,6 +613,7 @@ impl Tls {
                 Ok((rem, ref record)) => {
                     cur_data = rem;
                     status = self.parse_record_level(record, direction);
+                    self.client_first_record_parsed |= direction;
                     if status != ParseResult::Continue(0) {
                         return status;
                     }
@@ -569,17 +623,30 @@ impl Tls {
                         "Defragmentation required (TCP level), missing {:?} bytes",
                         needed
                     );
-                    self.tcp_buffer.extend_from_slice(cur_data);
+                    self.tcp_buffer[dir].extend_from_slice(cur_data);
                     break;
                 }
                 Err(_e) => {
                     log::debug!("warn: Parsing raw record failed");
+                    self.client_first_record_parsed |= direction;
                     break;
                 }
             }
         }
         status
     }
+}
+
+/// Number of ClientHello body bytes accounted for by its parsed fields.
+fn client_hello_len(content: &TlsClientHelloContents) -> usize {
+    2 + content.random.len()
+        + 1
+        + content.session_id.map_or(0, |sid| sid.len())
+        + 2
+        + 2 * content.ciphers.len()
+        + 1
+        + content.comp.len()
+        + content.ext.map_or(0, |ext| 2 + ext.len())
 }
 
 #[cfg(test)]
@@ -627,5 +694,317 @@ mod tests {
         tls.parse_tcp_level(&partial_record(6), true);
         assert!(tls.raw_data.is_empty());
         assert!(tls.raw_data_overflow);
+    }
+
+    const MSS: usize = 1460;
+
+    /// The bytes each side sent on one real TLS connection (see testdata/).
+    struct Transcript {
+        name: String,
+        client: Vec<u8>,
+        server: Vec<u8>,
+        /// JA3 string of the client's first ClientHello, computed without tls-parser
+        ja3: String,
+    }
+
+    impl Transcript {
+        /// The client's first TLS record, which holds its ClientHello.
+        fn client_hello(&self) -> &[u8] {
+            &self.client[..5 + u16::from_be_bytes([self.client[3], self.client[4]]) as usize]
+        }
+
+        /// What the client sent after its ClientHello record.
+        fn client_rest(&self) -> &[u8] {
+            &self.client[self.client_hello().len()..]
+        }
+    }
+
+    fn transcripts(tsv: &str) -> Vec<Transcript> {
+        tsv.lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                Transcript {
+                    name: fields[0].to_string(),
+                    client: hex::decode(fields[1]).unwrap(),
+                    server: hex::decode(fields[2]).unwrap(),
+                    ja3: fields[3].to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn corpus() -> Vec<Transcript> {
+        transcripts(include_str!("testdata/client_hellos.tsv"))
+    }
+
+    /// Transcripts whose server answered the first ClientHello with a HelloRetryRequest.
+    fn corpus_hrr() -> Vec<Transcript> {
+        transcripts(include_str!("testdata/client_hellos_hrr.tsv"))
+    }
+
+    fn transcript(name: &str) -> Transcript {
+        corpus().into_iter().find(|t| t.name == name).unwrap()
+    }
+
+    /// One direction's bytes cut into MSS-sized segment payloads (`true` is client to server).
+    fn segments(dir: bool, data: &[u8]) -> Vec<(bool, &[u8])> {
+        data.chunks(MSS).map(|chunk| (dir, chunk)).collect()
+    }
+
+    /// Feeds segment payloads to a new parser in the order reassembly delivers them, until the
+    /// parser is done.
+    fn deliver(payloads: &[(bool, &[u8])]) -> Tls {
+        let mut tls = Tls::new();
+        for &(dir, data) in payloads {
+            if let ParseResult::Done(_) = tls.parse_tcp_level(data, dir) {
+                break;
+            }
+        }
+        tls
+    }
+
+    /// Everything parsed from a ClientHello, for comparing parses.
+    fn fields(client_hello: &Option<ClientHello>) -> String {
+        format!("{:?}", client_hello)
+    }
+
+    /// The transcript's ClientHello parsed from its intact record, after checking its JA3.
+    fn intact(t: &Transcript) -> String {
+        let tls = deliver(&[(true, t.client_hello())]);
+        assert_eq!(tls.ja3_str(), t.ja3, "{}", t.name);
+        fields(&tls.client_hello)
+    }
+
+    #[test]
+    fn intact_client_hellos() {
+        for t in corpus().iter().chain(&corpus_hrr()) {
+            let want = intact(t);
+            // MSS-sized segments (two for a post-quantum ClientHello), then the server's reply
+            let mut payloads = segments(true, t.client_hello());
+            payloads.extend(segments(false, &t.server));
+            payloads.extend(segments(true, t.client_rest()));
+            assert_eq!(fields(&deliver(&payloads).client_hello), want, "{}", t.name);
+        }
+    }
+
+    #[test]
+    fn client_hello_split_at_any_byte() {
+        for t in corpus() {
+            let want = intact(&t);
+            let ch = t.client_hello();
+            for k in 1..ch.len() {
+                let tls = deliver(&[(true, &ch[..k]), (true, &ch[k..])]);
+                assert_eq!(fields(&tls.client_hello), want, "{} split at {}", t.name, k);
+            }
+        }
+    }
+
+    #[test]
+    fn server_bytes_before_second_segment_are_not_spliced() {
+        // Only transcripts whose server replied with a handshake: a server alert that
+        // arrives before the ClientHello is complete ends parsing without one. With
+        // client_hello_done, so does the server's ServerHello.
+        let want_none = cfg!(feature = "client_hello_done");
+        for t in corpus().iter().filter(|t| t.server.first() == Some(&0x16)) {
+            let want = if want_none { fields(&None) } else { intact(t) };
+            let ch = t.client_hello();
+            for k in 1..ch.len() {
+                let mut payloads = vec![(true, &ch[..k])];
+                payloads.extend(segments(false, &t.server));
+                payloads.push((true, &ch[k..]));
+                let tls = deliver(&payloads);
+                assert_eq!(fields(&tls.client_hello), want, "{} split at {}", t.name, k);
+            }
+        }
+    }
+
+    #[cfg(feature = "client_hello_done")]
+    #[test]
+    fn server_hello_before_client_hello_ends_parsing() {
+        // Segment 2 of the ClientHello was not captured, but the server answered it
+        for t in corpus().iter().filter(|t| t.server.first() == Some(&0x16)) {
+            let ch = t.client_hello();
+            let server_hello_len = 5 + u16::from_be_bytes([t.server[3], t.server[4]]) as usize;
+            let mut tls = Tls::new();
+            assert_eq!(
+                tls.parse_tcp_level(&ch[..ch.len() / 2], true),
+                ParseResult::Continue(0)
+            );
+            assert_eq!(
+                tls.parse_tcp_level(&t.server[..server_hello_len], false),
+                ParseResult::Done(0),
+                "{}",
+                t.name
+            );
+            assert!(tls.client_hello.is_none());
+            assert!(tls.server_hello.is_some());
+        }
+    }
+
+    #[test]
+    fn client_hello_missing_its_second_segment_is_not_completed() {
+        for t in corpus().iter().filter(|t| !t.server.is_empty()) {
+            let ch = t.client_hello();
+            for k in 1..ch.len() {
+                let mut payloads = vec![(true, &ch[..k])];
+                payloads.extend(segments(false, &t.server));
+                let tls = deliver(&payloads);
+                assert!(tls.client_hello.is_none(), "{} cut at {}", t.name, k);
+            }
+        }
+    }
+
+    #[test]
+    fn server_stream_shifted_by_missed_syn_ack_is_not_spliced() {
+        // A missed SYN-ACK used to make reassembly drop the server's first byte, so its
+        // bytes started 03 03 00 7a 02 instead of 16 03 03 00 7a 02
+        for t in corpus().iter().filter(|t| t.server.len() > 1) {
+            let want = intact(t);
+            let ch = t.client_hello();
+            for k in 1..ch.len() {
+                let mut payloads = vec![(true, &ch[..k])];
+                payloads.extend(segments(false, &t.server[1..]));
+                let tls = deliver(&payloads);
+                assert!(tls.client_hello.is_none(), "{} cut at {}", t.name, k);
+
+                payloads.push((true, &ch[k..]));
+                let tls = deliver(&payloads);
+                assert_eq!(fields(&tls.client_hello), want, "{} split at {}", t.name, k);
+            }
+        }
+    }
+
+    #[test]
+    fn hello_retry_request_keeps_first_client_hello() {
+        for t in corpus_hrr() {
+            let want = intact(&t);
+            let hello = segments(true, t.client_hello());
+            let rest = segments(true, t.client_rest());
+            let server = segments(false, &t.server);
+            let shifted_server = segments(false, &t.server[1..]);
+            for (case, payloads) in [
+                ("both sides", [&hello[..], &server[..], &rest[..]].concat()),
+                ("client side only", [&hello[..], &rest[..]].concat()),
+                (
+                    "server shifted",
+                    [&hello[..], &shifted_server[..], &rest[..]].concat(),
+                ),
+            ] {
+                let tls = deliver(&payloads);
+                assert_eq!(fields(&tls.client_hello), want, "{}: {}", t.name, case);
+            }
+        }
+    }
+
+    #[test]
+    fn later_client_hello_does_not_stand_in_for_a_lost_first_one() {
+        for t in corpus_hrr() {
+            // CCS, then the second ClientHello
+            let rest = t.client_rest();
+
+            // First ClientHello split across two TLS records, which is not parsed
+            let handshake = &t.client_hello()[5..];
+            let (head, tail) = handshake.split_at(handshake.len() / 2);
+            let records = [handshake_record(head), handshake_record(tail)].concat();
+            let tls = deliver(&[(true, &records), (true, rest)]);
+            assert!(tls.client_hello.is_none(), "{}: split records", t.name);
+
+            // First bytes of the first ClientHello not seen
+            let tls = deliver(&[(true, &t.client_hello()[2..]), (true, rest)]);
+            assert!(tls.client_hello.is_none(), "{}: cut", t.name);
+        }
+    }
+
+    #[test]
+    fn client_hello_sent_by_server_is_ignored() {
+        let t = transcript("utls_chrome133__default");
+        let ch = t.client_hello();
+        assert!(deliver(&[(false, ch)]).client_hello.is_none());
+        let tls = deliver(&[(false, ch), (true, ch)]);
+        assert_eq!(fields(&tls.client_hello), intact(&t));
+    }
+
+    #[cfg(not(feature = "client_hello_done"))]
+    #[test]
+    fn both_sides_reassemble_records_independently() {
+        // Each side's first record is split, and the other side's bytes arrive in between
+        let t = transcript("go_stdlib__tls12");
+        let (ch, server) = (t.client_hello(), &t.server);
+        let tls = deliver(&[
+            (true, &ch[..MSS]),
+            (false, &server[..40]),
+            (true, &ch[MSS..]),
+            (false, &server[40..]),
+        ]);
+        assert_eq!(fields(&tls.client_hello), intact(&t));
+        assert_eq!(tls.cipher(), "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256");
+        assert_eq!(tls.server_certificates.len(), 1);
+    }
+
+    /// Splits a ClientHello record into its body up to the extension block, and the extensions.
+    fn split_client_hello(record: &[u8]) -> (&[u8], &[u8]) {
+        let body = &record[9..];
+        let mut len = 2 + 32; // version, random
+        len += 1 + body[len] as usize; // session id
+        len += 2 + u16::from_be_bytes([body[len], body[len + 1]]) as usize; // cipher suites
+        len += 1 + body[len] as usize; // compression methods
+        (&body[..len], &body[len + 2..])
+    }
+
+    /// A ClientHello body: `head`, then an extension block declared `ext_len` bytes long that
+    /// holds `exts`.
+    fn with_extensions(head: &[u8], ext_len: usize, exts: &[u8]) -> Vec<u8> {
+        [head, &(ext_len as u16).to_be_bytes()[..], exts].concat()
+    }
+
+    /// A TLS handshake record carrying `fragment`.
+    fn handshake_record(fragment: &[u8]) -> Vec<u8> {
+        [
+            &[0x16, 0x03, 0x01][..],
+            &(fragment.len() as u16).to_be_bytes(),
+            fragment,
+        ]
+        .concat()
+    }
+
+    /// A TLS record holding one ClientHello with the given body.
+    fn client_hello_record(body: &[u8]) -> Vec<u8> {
+        handshake_record(&[&[0x01][..], &(body.len() as u32).to_be_bytes()[1..], body].concat())
+    }
+
+    #[test]
+    fn client_hello_with_unparsed_extensions_is_rejected() {
+        let t = transcript("utls_chrome120__default");
+        let (head, exts) = split_client_hello(t.client_hello());
+        let parse = |body: &[u8]| deliver(&[(true, &client_hello_record(body))]).client_hello;
+        let body = with_extensions(head, exts.len(), exts);
+        assert_eq!(client_hello_record(&body), t.client_hello());
+
+        // Last extension's data runs past the extension block (key_share declaring 0x500 bytes)
+        let truncated = [exts, &[0x00, 0x33, 0x05, 0x00, 0x01][..]].concat();
+        assert!(parse(&with_extensions(head, truncated.len(), &truncated)).is_none());
+
+        // An extension whose contents do not parse (psk_key_exchange_modes listing 5 modes in
+        // 1 byte)
+        let bad = [exts, &[0x00, 0x2d, 0x00, 0x02, 0x05, 0x01][..]].concat();
+        assert!(parse(&with_extensions(head, bad.len(), &bad)).is_none());
+
+        // Extension block declared longer than the ClientHello: tls-parser gives ext=None
+        assert!(parse(&with_extensions(head, exts.len() + 1, exts)).is_none());
+
+        // Bytes after the extension block
+        assert!(parse(&[&body[..], &[0x00][..]].concat()).is_none());
+    }
+
+    #[test]
+    fn client_hello_without_extensions_is_kept() {
+        let t = transcript("utls_chrome120__default");
+        let (head, _) = split_client_hello(t.client_hello());
+        let ch = deliver(&[(true, &client_hello_record(head))])
+            .client_hello
+            .unwrap();
+        assert!(ch.extension_list.is_empty());
+        assert_eq!(ch.cipher_suites.len(), 16);
     }
 }
